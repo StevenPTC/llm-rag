@@ -1,0 +1,330 @@
+# PDF RAG Demo
+
+這個專案示範一條最小可用的 RAG 流程，從讀取 PDF、切分文字、產生向量、建立索引，到最後用本機 LLM 問答。
+
+目前專案預設：
+- PDF 放在 `docs/`
+- 中間產物放在 `data/`
+- 向量檢索預設使用 `FAISS`
+- 最終回答預設使用 `Ollama` 上的 `qwen3.5:9b`
+
+## 這個專案在做什麼
+
+RAG 的核心流程是：
+
+1. 讀取 PDF 文字
+2. 把長文字切成較小的 chunks
+3. 把 chunks 轉成向量 embeddings
+4. 把向量存進索引
+5. 查詢時先找出最相關的 chunks
+6. 把這些 chunks 當作 context 交給 LLM 回答
+
+這樣做的好處是，LLM 回答時不是只靠模型內部記憶，而是能參考你自己的 PDF 文件內容。
+
+## 專案結構
+
+```text
+rag-project/
+├─ docs/                  # 原始 PDF
+├─ data/                  # 前處理、embedding、index 的輸出
+├─ pyPDF.py               # PDF 文字抽取與 chunk 切分
+├─ embedding.py           # 將 chunks 轉成 embeddings
+├─ index.py               # 建立向量索引（FAISS / Chroma）
+├─ query.py               # 查詢 RAG
+├─ rag_utils.py           # 共用工具函式
+├─ requirements.txt       # Python 套件需求
+└─ README.md
+```
+
+## 各檔案用途
+
+### `pyPDF.py`
+
+負責：
+- 掃描 `docs/*.pdf`
+- 逐頁抽取文字
+- 清理多餘空白
+- 依 `chunk_size=800`、`overlap=150` 進行切塊
+
+輸出：
+- `data/pdf_pages.jsonl`
+- `data/pdf_chunks.jsonl`
+
+### `embedding.py`
+
+負責：
+- 讀取 `data/pdf_chunks.jsonl`
+- 使用 `sentence-transformers` 產生每個 chunk 的向量
+
+輸出：
+- `data/embeddings.npy`
+- `data/embedding_metadata.jsonl`
+
+### `index.py`
+
+負責：
+- 讀取 embeddings
+- 建立向量索引
+
+可選 backend：
+- `faiss`
+- `chroma`
+
+輸出：
+- FAISS:
+  - `data/faiss.index`
+  - `data/faiss_metadata.jsonl`
+- Chroma:
+  - `data/chroma_db/`
+
+### `query.py`
+
+負責：
+- 對問題做 embedding
+- 從向量索引中找出最相關的 chunks
+- 將檢索結果交給 LLM 生成答案
+
+預設：
+- 檢索 backend: `faiss`
+- LLM provider: `ollama`
+- Chat model: `qwen3.5:9b`
+
+## 安裝需求
+
+建議先啟用虛擬環境，再安裝套件：
+
+```bash
+pip install -r requirements.txt
+```
+
+`requirements.txt` 包含：
+- `PyMuPDF`
+- `numpy`
+- `sentence-transformers`
+- `faiss-cpu`
+- `chromadb`
+- `openai`
+
+## Ollama 使用方式
+
+你目前是使用本機 Ollama，這個專案已經支援。
+
+先確認模型已安裝：
+
+```bash
+ollama list
+```
+
+確認 Ollama server 有在回應：
+
+```bash
+curl http://localhost:11434/api/tags
+```
+
+確認模型目前是否已經載入記憶體：
+
+```bash
+ollama ps
+```
+
+如果你平常用這個指令：
+
+```bash
+ollama run qwen3.5:9b
+```
+
+那通常代表：
+- 模型已經存在本機
+- Ollama 服務也會一起被用到
+
+本專案的 `query.py` 會直接呼叫 Ollama API：
+
+```text
+http://localhost:11434/api/chat
+```
+
+## 使用流程
+
+### 1. 抽取 PDF 文字
+
+把 PDF 放進 `docs/` 之後執行：
+
+```bash
+python3 pyPDF.py
+```
+
+輸出：
+- `data/pdf_pages.jsonl`
+- `data/pdf_chunks.jsonl`
+
+### 2. 產生 embeddings
+
+```bash
+python3 embedding.py
+```
+
+輸出：
+- `data/embeddings.npy`
+- `data/embedding_metadata.jsonl`
+
+如果你想指定不同的 embedding model：
+
+```bash
+python3 embedding.py --model sentence-transformers/all-MiniLM-L6-v2
+```
+
+### 3. 建立索引
+
+預設使用 FAISS：
+
+```bash
+python3 index.py --backend faiss
+```
+
+如果想改用 Chroma：
+
+```bash
+python3 index.py --backend chroma
+```
+
+### 4. 查詢
+
+使用預設設定查詢：
+
+```bash
+python3 query.py "這份文件的 CPU 是什麼？"
+```
+
+這會：
+- 先做向量檢索
+- 印出 retrieved contexts
+- 再把 context 交給 Ollama 的 `qwen3.5:9b` 回答
+
+如果只想看檢索結果，不呼叫 LLM：
+
+```bash
+python3 query.py "這份文件的 CPU 是什麼？" --retrieval-only
+```
+
+如果想切到 Chroma：
+
+```bash
+python3 query.py "這份文件的 CPU 是什麼？" --backend chroma
+```
+
+如果 Ollama API 不在預設位置：
+
+```bash
+python3 query.py "這份文件的 CPU 是什麼？" --ollama-base-url http://localhost:11434
+```
+
+如果要改用 OpenAI：
+
+```bash
+python3 query.py "這份文件的 CPU 是什麼？" --llm-provider openai --chat-model gpt-4.1-mini
+```
+
+這時需要設定：
+
+```bash
+export OPENAI_API_KEY=your_api_key
+```
+
+## 主要輸出檔案說明
+
+### `data/pdf_pages.jsonl`
+
+每行一筆頁級資料，例如：
+
+```json
+{"source":"P05D00107-00.pdf","page":1,"text":"..."}
+```
+
+用途：
+- 保留逐頁原文
+- 方便除錯與回查頁碼
+
+### `data/pdf_chunks.jsonl`
+
+每行一筆 chunk 級資料，例如：
+
+```json
+{"chunk_id":"P05D00107-00.pdf-p1-c1","source":"P05D00107-00.pdf","page":1,"chunk_index":1,"text":"..."}
+```
+
+用途：
+- 直接作為 embedding 的輸入
+- 是 RAG 最核心的中間資料
+
+### `data/embeddings.npy`
+
+NumPy 格式的向量矩陣。
+
+用途：
+- 每一列對應一個 chunk 的 embedding
+- 供 `index.py` 建立向量索引
+
+### `data/embedding_metadata.jsonl`
+
+保留和向量對應的 chunk metadata。
+
+用途：
+- 讓檢索到的向量可以對回原始文字、來源 PDF、頁碼
+
+### `data/faiss.index`
+
+FAISS 向量索引本體。
+
+用途：
+- 查詢時快速找相似 chunks
+
+### `data/faiss_metadata.jsonl`
+
+FAISS 檢索結果對應的 metadata。
+
+用途：
+- 根據向量索引位置還原 chunk 文字與來源資訊
+
+## 常見問題
+
+### 1. `ModuleNotFoundError`
+
+代表套件還沒安裝，先執行：
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. `query.py` 沒有輸出最終答案
+
+可能原因：
+- Ollama 沒有啟動
+- `qwen3.5:9b` 沒有安裝
+- 使用的是 `openai` 但未設定 `OPENAI_API_KEY`
+
+可以先檢查：
+
+```bash
+ollama list
+ollama ps
+curl http://localhost:11434/api/tags
+```
+
+### 3. 查得到內容，但答案不夠準
+
+可以調整：
+- `pyPDF.py` 的 `chunk_size`
+- `pyPDF.py` 的 `overlap`
+- `query.py` 的 `--top-k`
+- embedding model
+
+## 建議的最小操作順序
+
+```bash
+python3 pyPDF.py
+python3 embedding.py
+python3 index.py --backend faiss
+python3 query.py "這份文件的 CPU 是什麼？"
+```
+
+如果這四步能順利跑完，就代表這個專案的第一版 RAG 流程已經通了。
