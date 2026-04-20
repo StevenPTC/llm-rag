@@ -30,9 +30,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chat-model", default=DEFAULT_CHAT_MODEL, help="LLM chat model name")
     parser.add_argument(
+        "--think",
+        choices=["false", "true", "low", "medium", "high"],
+        default="false",
+        help="Thinking mode for supported Ollama models",
+    )
+    parser.add_argument(
         "--ollama-base-url",
         default=DEFAULT_OLLAMA_BASE_URL,
         help="Ollama server base URL",
+    )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=120,
+        help="Timeout in seconds for the Ollama API call",
     )
     parser.add_argument(
         "--retrieval-only",
@@ -114,11 +126,20 @@ def answer_with_openai(question: str, results: list[dict], chat_model: str) -> s
     return response.output_text
 
 
-def answer_with_ollama(question: str, results: list[dict], chat_model: str, ollama_base_url: str) -> str:
+def answer_with_ollama(
+    question: str,
+    results: list[dict],
+    chat_model: str,
+    think: str,
+    ollama_base_url: str,
+    ollama_timeout: int,
+) -> str:
     return call_ollama_chat(
         prompt=build_prompt(question, results),
         model=chat_model,
+        think=False if think == "false" else (True if think == "true" else think),
         base_url=ollama_base_url,
+        timeout=ollama_timeout,
     )
 
 
@@ -137,10 +158,22 @@ def main() -> None:
 
     try:
         if args.llm_provider == "openai":
+            print("Calling OpenAI for final answer...\n")
             answer = answer_with_openai(args.question, results, args.chat_model)
         else:
-            answer = answer_with_ollama(args.question, results, args.chat_model, args.ollama_base_url)
-    except (ConnectionError, EnvironmentError, ImportError, RuntimeError) as exc:
+            print(
+                f"Calling Ollama for final answer with model `{args.chat_model}` "
+                f"at `{args.ollama_base_url}` with think=`{args.think}`...\n"
+            )
+            answer = answer_with_ollama(
+                args.question,
+                results,
+                args.chat_model,
+                args.think,
+                args.ollama_base_url,
+                args.ollama_timeout,
+            )
+    except (ConnectionError, EnvironmentError, ImportError, RuntimeError, TimeoutError) as exc:
         print(f"LLM answer skipped: {exc}")
         return
 

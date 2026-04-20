@@ -94,6 +94,8 @@ def call_ollama_chat(
     prompt: str,
     model: str = DEFAULT_CHAT_MODEL,
     base_url: str = DEFAULT_OLLAMA_BASE_URL,
+    timeout: int = 120,
+    think: bool | str = False,
 ) -> str:
     payload = {
         "model": model,
@@ -104,6 +106,7 @@ def call_ollama_chat(
             }
         ],
         "stream": False,
+        "think": think,
     }
     request = urllib.request.Request(
         url=f"{base_url.rstrip('/')}/api/chat",
@@ -113,11 +116,15 @@ def call_ollama_chat(
     )
 
     try:
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise ConnectionError(
             f"Cannot reach Ollama at {base_url}. Make sure `ollama serve` is running."
+        ) from exc
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"Ollama did not respond within {timeout} seconds. Try a smaller model or increase the timeout."
         ) from exc
 
     message = body.get("message", {})
