@@ -6,7 +6,7 @@
 - PDF 放在 `docs/`
 - 中間產物放在 `data/`
 - 向量檢索預設使用 `FAISS`
-- 最終回答預設使用 `Ollama` 上的 `qwen3.5:9b`
+- 最終回答預設使用本機 `Ollama`，並在查詢時選擇本機已安裝模型
 
 ## 這個專案在做什麼
 
@@ -87,7 +87,7 @@ rag-project/
 預設：
 - 檢索 backend: `faiss`
 - LLM provider: `ollama`
-- Chat model: `qwen3.5:9b`
+- Chat model: 若未指定，會列出本機 Ollama 模型讓使用者選擇
 
 ## 安裝需求
 
@@ -127,7 +127,7 @@ curl http://localhost:11434/api/tags
 ollama ps
 ```
 
-如果你平常用這個指令：
+如果你平常用類似這樣的指令：
 
 ```bash
 ollama run qwen3.5:9b
@@ -198,7 +198,20 @@ python3 query.py "這份文件的 CPU 是什麼？"
 這會：
 - 先做向量檢索
 - 印出 retrieved contexts
-- 再把 context 交給 Ollama 的 `qwen3.5:9b` 回答
+- 列出本機 Ollama 模型讓你選擇
+- 再把 context 交給選到的模型回答
+
+如果已經知道要用哪個 Ollama 模型，可以直接指定：
+
+```bash
+python3 query.py "這份文件的 CPU 是什麼？" --chat-model qwen3.5:9b
+```
+
+若模型支援 thinking，預設會關閉 thinking：
+
+```bash
+python3 query.py "這份文件的 CPU 是什麼？" --think false
+```
 
 如果只想看檢索結果，不呼叫 LLM：
 
@@ -299,7 +312,7 @@ pip install -r requirements.txt
 
 可能原因：
 - Ollama 沒有啟動
-- `qwen3.5:9b` 沒有安裝
+- 選擇的 Ollama 模型沒有安裝
 - 使用的是 `openai` 但未設定 `OPENAI_API_KEY`
 
 可以先檢查：

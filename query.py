@@ -2,16 +2,17 @@ import argparse
 
 from rag_utils import (
     CHROMA_DIR,
-    DEFAULT_CHAT_MODEL,
     DEFAULT_EMBED_MODEL,
     DEFAULT_LLM_PROVIDER,
     DEFAULT_OLLAMA_BASE_URL,
+    DEFAULT_OPENAI_CHAT_MODEL,
     FAISS_INDEX_PATH,
     FAISS_METADATA_PATH,
     build_prompt,
     call_ollama_chat,
     embed_texts,
     ensure_openai_client,
+    list_ollama_models,
     load_jsonl,
 )
 
@@ -28,7 +29,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_LLM_PROVIDER,
         help="LLM provider for final answer generation",
     )
-    parser.add_argument("--chat-model", default=DEFAULT_CHAT_MODEL, help="LLM chat model name")
+    parser.add_argument(
+        "--chat-model",
+        default=None,
+        help="LLM chat model name. For Ollama, omit this to select from local models.",
+    )
     parser.add_argument(
         "--think",
         choices=["false", "true", "low", "medium", "high"],
@@ -43,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ollama-timeout",
         type=int,
-        default=120,
+        default=1200,
         help="Timeout in seconds for the Ollama API call",
     )
     parser.add_argument(
@@ -143,6 +148,29 @@ def answer_with_ollama(
     )
 
 
+def select_ollama_model(base_url: str) -> str:
+    models = list_ollama_models(base_url=base_url)
+    if not models:
+        raise RuntimeError("No Ollama models found. Install one with `ollama pull <model>` first.")
+
+    if len(models) == 1:
+        print(f"Using the only local Ollama model: {models[0]}\n")
+        return models[0]
+
+    print("Local Ollama models:")
+    for idx, model in enumerate(models, start=1):
+        print(f"{idx}. {model}")
+
+    while True:
+        choice = input("Select a model number: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            selected_model = models[int(choice) - 1]
+            print(f"Selected model: {selected_model}\n")
+            return selected_model
+
+        print(f"Please enter a number from 1 to {len(models)}.")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -158,17 +186,19 @@ def main() -> None:
 
     try:
         if args.llm_provider == "openai":
-            print("Calling OpenAI for final answer...\n")
-            answer = answer_with_openai(args.question, results, args.chat_model)
+            chat_model = args.chat_model or DEFAULT_OPENAI_CHAT_MODEL
+            print(f"Calling OpenAI for final answer with model `{chat_model}`...\n")
+            answer = answer_with_openai(args.question, results, chat_model)
         else:
+            chat_model = args.chat_model or select_ollama_model(args.ollama_base_url)
             print(
-                f"Calling Ollama for final answer with model `{args.chat_model}` "
+                f"Calling Ollama for final answer with model `{chat_model}` "
                 f"at `{args.ollama_base_url}` with think=`{args.think}`...\n"
             )
             answer = answer_with_ollama(
                 args.question,
                 results,
-                args.chat_model,
+                chat_model,
                 args.think,
                 args.ollama_base_url,
                 args.ollama_timeout,
