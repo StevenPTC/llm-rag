@@ -109,7 +109,13 @@ def search_chroma(question: str, top_k: int, embed_model: str) -> list[dict]:
                 "chunk_id": chunk_id,
                 "source": metadata["source"],
                 "page": metadata["page"],
+                "start_page": metadata.get("start_page", metadata["page"]),
+                "end_page": metadata.get("end_page", metadata["page"]),
                 "chunk_index": metadata["chunk_index"],
+                "section": metadata.get("section", ""),
+                "title": metadata.get("title", ""),
+                "doc_type": metadata.get("doc_type", ""),
+                "language": metadata.get("language", ""),
                 "text": document,
                 "score": float(distance),
             }
@@ -120,7 +126,12 @@ def search_chroma(question: str, top_k: int, embed_model: str) -> list[dict]:
 def print_results(results: list[dict]) -> None:
     print("\nRetrieved contexts:\n")
     for idx, item in enumerate(results, start=1):
-        print(f"[{idx}] score={item['score']:.4f} source={item['source']} page={item['page']}")
+        start_page = item.get("start_page", item["page"])
+        end_page = item.get("end_page", item["page"])
+        page_label = start_page if start_page == end_page else f"{start_page}-{end_page}"
+        section = item.get("section") or item.get("title") or ""
+        section_label = f" section={section}" if section else ""
+        print(f"[{idx}] score={item['score']:.4f} source={item['source']} page={page_label}{section_label}")
         print(item["text"])
         print()
 

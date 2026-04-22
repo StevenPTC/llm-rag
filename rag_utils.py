@@ -166,15 +166,20 @@ def call_ollama_chat(
 def format_contexts(results: list[dict]) -> str:
     blocks = []
     for idx, item in enumerate(results, start=1):
+        start_page = item.get("start_page", item["page"])
+        end_page = item.get("end_page", item["page"])
+        page_label = start_page if start_page == end_page else f"{start_page}-{end_page}"
+        section = item.get("section") or item.get("title") or ""
+        metadata_lines = [
+            f"[Context {idx}]",
+            f"source: {item['source']}",
+            f"page: {page_label}",
+        ]
+        if section:
+            metadata_lines.append(f"section: {section}")
+        metadata_lines.append(f"text: {item['text']}")
         blocks.append(
-            "\n".join(
-                [
-                    f"[Context {idx}]",
-                    f"source: {item['source']}",
-                    f"page: {item['page']}",
-                    f"text: {item['text']}",
-                ]
-            )
+            "\n".join(metadata_lines)
         )
     return "\n\n".join(blocks)
 
