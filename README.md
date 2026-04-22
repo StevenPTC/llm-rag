@@ -7,6 +7,7 @@
 - 中間產物放在 `data/`
 - 向量檢索預設使用 `FAISS`
 - 最終回答預設使用本機 `Ollama`，並在查詢時選擇本機已安裝模型
+- PDF 前處理會保留頁碼、章節、char range、產品、版本與 tags 等 metadata
 
 ## 這個專案在做什麼
 
@@ -43,8 +44,13 @@ rag-project/
 負責：
 - 掃描 `docs/*.pdf`
 - 逐頁抽取文字
-- 清理多餘空白
-- 依 `chunk_size=800`、`overlap=150` 進行切塊
+- 清理多餘空白、頁碼、重複頁首頁尾與常見浮水印文字
+- 修正 PDF 斷字，例如 `auto-\nmatically`
+- 先合併同一份 PDF，再做可跨頁的語意切塊
+- 依 `chunk_size=800`、`overlap=120` 進行 span-based overlap
+- 記錄 `char_start` / `char_end`，讓 chunk 可回查原文位置
+- 偵測 `section` / `title` / `doc_type` / `product` / `version` / `tags`
+- FAQ 文件若包含 `Q:` / `A:` 或 `Question:` / `Answer:`，會優先以 QA pair 作為 chunk
 
 輸出：
 - `data/pdf_pages.jsonl`
@@ -94,6 +100,8 @@ rag-project/
 建議先啟用虛擬環境，再安裝套件：
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -145,12 +153,18 @@ http://localhost:11434/api/chat
 
 ## 使用流程
 
+建議使用虛擬環境中的 Python 執行：
+
+```bash
+source .venv/bin/activate
+```
+
 ### 1. 抽取 PDF 文字
 
 把 PDF 放進 `docs/` 之後執行：
 
 ```bash
-python3 pyPDF.py
+.venv/bin/python pyPDF.py
 ```
 
 輸出：
@@ -160,7 +174,7 @@ python3 pyPDF.py
 ### 2. 產生 embeddings
 
 ```bash
-python3 embedding.py
+.venv/bin/python embedding.py
 ```
 
 輸出：
@@ -170,7 +184,7 @@ python3 embedding.py
 如果你想指定不同的 embedding model：
 
 ```bash
-python3 embedding.py --model sentence-transformers/all-MiniLM-L6-v2
+.venv/bin/python embedding.py --model sentence-transformers/all-MiniLM-L6-v2
 ```
 
 ### 3. 建立索引
@@ -178,13 +192,13 @@ python3 embedding.py --model sentence-transformers/all-MiniLM-L6-v2
 預設使用 FAISS：
 
 ```bash
-python3 index.py --backend faiss
+.venv/bin/python index.py --backend faiss
 ```
 
 如果想改用 Chroma：
 
 ```bash
-python3 index.py --backend chroma
+.venv/bin/python index.py --backend chroma
 ```
 
 ### 4. 查詢
@@ -192,7 +206,7 @@ python3 index.py --backend chroma
 使用預設設定查詢：
 
 ```bash
-python3 query.py "這份文件的 CPU 是什麼？"
+.venv/bin/python query.py "這份文件的 CPU 是什麼？"
 ```
 
 這會：
@@ -204,43 +218,72 @@ python3 query.py "這份文件的 CPU 是什麼？"
 如果已經知道要用哪個 Ollama 模型，可以直接指定：
 
 ```bash
-python3 query.py "這份文件的 CPU 是什麼？" --chat-model qwen3.5:9b
+.venv/bin/python query.py "這份文件的 CPU 是什麼？" --chat-model qwen3.5:9b
 ```
 
 若模型支援 thinking，預設會關閉 thinking：
 
 ```bash
-python3 query.py "這份文件的 CPU 是什麼？" --think false
+.venv/bin/python query.py "這份文件的 CPU 是什麼？" --think false
 ```
 
 如果只想看檢索結果，不呼叫 LLM：
 
 ```bash
-python3 query.py "這份文件的 CPU 是什麼？" --retrieval-only
+.venv/bin/python query.py "這份文件的 CPU 是什麼？" --retrieval-only
 ```
 
 如果想切到 Chroma：
 
 ```bash
-python3 query.py "這份文件的 CPU 是什麼？" --backend chroma
+.venv/bin/python query.py "這份文件的 CPU 是什麼？" --backend chroma
 ```
 
 如果 Ollama API 不在預設位置：
 
 ```bash
-python3 query.py "這份文件的 CPU 是什麼？" --ollama-base-url http://localhost:11434
+.venv/bin/python query.py "這份文件的 CPU 是什麼？" --ollama-base-url http://localhost:11434
 ```
 
 如果要改用 OpenAI：
 
 ```bash
-python3 query.py "這份文件的 CPU 是什麼？" --llm-provider openai --chat-model gpt-4.1-mini
+.venv/bin/python query.py "這份文件的 CPU 是什麼？" --llm-provider openai --chat-model gpt-4.1-mini
 ```
 
 這時需要設定：
 
 ```bash
 export OPENAI_API_KEY=your_api_key
+```
+
+## 完整重建流程
+
+當 `docs/` 裡的 PDF 有新增、刪除或內容更新時，建議從前處理開始完整重建：
+
+```bash
+.venv/bin/python pyPDF.py
+.venv/bin/python embedding.py
+.venv/bin/python index.py --backend faiss
+```
+
+只檢查檢索結果，不呼叫 LLM：
+
+```bash
+.venv/bin/python query.py "Which product uses RK3568?" --backend faiss --retrieval-only
+```
+
+確認檢索正常後，再呼叫 LLM：
+
+```bash
+.venv/bin/python query.py "Which product uses RK3568?" --backend faiss --chat-model qwen3.5:9b
+```
+
+如果使用 Chroma，索引與查詢都要指定同一個 backend：
+
+```bash
+.venv/bin/python index.py --backend chroma
+.venv/bin/python query.py "Which product uses RK3568?" --backend chroma --retrieval-only
 ```
 
 ## 主要輸出檔案說明
@@ -250,7 +293,7 @@ export OPENAI_API_KEY=your_api_key
 每行一筆頁級資料，例如：
 
 ```json
-{"source":"P05D00107-00.pdf","page":1,"text":"..."}
+{"source":"P05D00107-00.pdf","file_path":"/home/steven/rag-project/docs/P05D00107-00.pdf","page":1,"text":"..."}
 ```
 
 用途：
@@ -262,12 +305,14 @@ export OPENAI_API_KEY=your_api_key
 每行一筆 chunk 級資料，例如：
 
 ```json
-{"chunk_id":"P05D00107-00.pdf-p1-c1","source":"P05D00107-00.pdf","page":1,"chunk_index":1,"text":"..."}
+{"chunk_id":"P05D00107-00.pdf-p1-1-c1","source":"P05D00107-00.pdf","file_path":"/home/steven/rag-project/docs/P05D00107-00.pdf","page":1,"start_page":1,"end_page":1,"char_start":0,"char_end":696,"chunk_index":1,"section":"Hardware","title":"Hardware","doc_type":"datasheet","product":"P05D00107-00","version":"Yocto 4.0","language":"en","tags":["hardware","software","ethernet"],"text":"..."}
 ```
 
 用途：
 - 直接作為 embedding 的輸入
 - 是 RAG 最核心的中間資料
+- 透過 `start_page` / `end_page` / `char_start` / `char_end` 回查來源位置
+- 透過 `product` / `version` / `tags` 支援後續 filter 或 hybrid search
 
 ### `data/embeddings.npy`
 
@@ -330,14 +375,23 @@ curl http://localhost:11434/api/tags
 - `pyPDF.py` 的 `overlap`
 - `query.py` 的 `--top-k`
 - embedding model
+- 後續可加入 BM25 hybrid search 與 reranker
+
+### 4. `python3 pyPDF.py` 找不到 `fitz`
+
+通常代表目前 shell 沒有使用專案虛擬環境。請改用：
+
+```bash
+.venv/bin/python pyPDF.py
+```
 
 ## 建議的最小操作順序
 
 ```bash
-python3 pyPDF.py
-python3 embedding.py
-python3 index.py --backend faiss
-python3 query.py "這份文件的 CPU 是什麼？"
+.venv/bin/python pyPDF.py
+.venv/bin/python embedding.py
+.venv/bin/python index.py --backend faiss
+.venv/bin/python query.py "這份文件的 CPU 是什麼？"
 ```
 
 如果這四步能順利跑完，就代表這個專案的第一版 RAG 流程已經通了。

@@ -53,11 +53,16 @@ def build_chroma_index() -> None:
             "page": record["page"],
             "start_page": record.get("start_page", record["page"]),
             "end_page": record.get("end_page", record["page"]),
+            "char_start": record.get("char_start", 0),
+            "char_end": record.get("char_end", 0),
             "chunk_index": record["chunk_index"],
             "section": record.get("section", ""),
             "title": record.get("title", ""),
             "doc_type": record.get("doc_type", ""),
+            "product": record.get("product", ""),
+            "version": record.get("version", ""),
             "language": record.get("language", ""),
+            "tags": ",".join(record.get("tags", [])),
             "file_path": record.get("file_path", ""),
         }
         for record in metadata

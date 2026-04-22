@@ -177,6 +177,12 @@ def format_contexts(results: list[dict]) -> str:
         ]
         if section:
             metadata_lines.append(f"section: {section}")
+        if item.get("product"):
+            metadata_lines.append(f"product: {item['product']}")
+        if item.get("version"):
+            metadata_lines.append(f"version: {item['version']}")
+        if item.get("char_start") is not None and item.get("char_end") is not None:
+            metadata_lines.append(f"char_range: {item['char_start']}-{item['char_end']}")
         metadata_lines.append(f"text: {item['text']}")
         blocks.append(
             "\n".join(metadata_lines)

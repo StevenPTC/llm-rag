@@ -10,8 +10,8 @@ OUTPUT_DIR = Path.home() / "rag-project" / "data"
 RAW_OUTPUT = OUTPUT_DIR / "pdf_pages.jsonl"
 CHUNK_OUTPUT = OUTPUT_DIR / "pdf_chunks.jsonl"
 DEFAULT_CHUNK_SIZE = 800
-DEFAULT_CHUNK_OVERLAP = 150
-SPLIT_SEPARATORS = ["\n\n", "\n", "。", ".", " ", ""]
+DEFAULT_CHUNK_OVERLAP = 120
+SPLIT_SEPARATORS = ["\n\n", "\n", "Q:", "A:", "Question:", "Answer:", ". ", "; ", ", ", " ", ""]
 HEADER_FOOTER_MIN_PAGES = 2
 
 
@@ -92,68 +92,151 @@ def remove_header_footer(text: str, repeated_lines: set[str]) -> str:
     return normalize_text("\n".join(cleaned_lines))
 
 
-def recursive_split_text(
+def make_chunk_span(text: str, start: int, end: int, base_offset: int = 0) -> dict | None:
+    relative_start = start - base_offset
+    relative_end = end - base_offset
+
+    while relative_start < relative_end and text[relative_start].isspace():
+        relative_start += 1
+        start += 1
+    while relative_end > relative_start and text[relative_end - 1].isspace():
+        relative_end -= 1
+        end -= 1
+
+    if relative_start >= relative_end:
+        return None
+    return {"text": text[relative_start:relative_end], "start": start, "end": end}
+
+
+def recursive_split_spans(
     text: str,
+    start_offset: int = 0,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     separators: list[str] | None = None,
-) -> list[str]:
+) -> list[dict]:
     if len(text) <= chunk_size:
-        return [text]
+        span = make_chunk_span(text, start_offset, start_offset + len(text), base_offset=start_offset)
+        return [span] if span else []
 
     separators = separators or SPLIT_SEPARATORS
     separator = separators[0]
     remaining_separators = separators[1:]
 
-    if separator:
-        splits = text.split(separator)
-    else:
-        splits = list(text)
+    if not separator:
+        spans = []
+        for relative_start in range(0, len(text), chunk_size):
+            relative_end = min(relative_start + chunk_size, len(text))
+            span = make_chunk_span(
+                text,
+                start_offset + relative_start,
+                start_offset + relative_end,
+                base_offset=start_offset,
+            )
+            if span:
+                spans.append(span)
+        return spans
 
-    if separator and len(splits) == 1:
-        return recursive_split_text(text, chunk_size, remaining_separators)
+    split_points = []
+    cursor = 0
+    while True:
+        idx = text.find(separator, cursor)
+        if idx < 0:
+            break
+        split_points.append(idx + len(separator))
+        cursor = idx + len(separator)
 
-    chunks = []
-    current = ""
-    joiner = separator
+    if not split_points:
+        return recursive_split_spans(text, start_offset, chunk_size, remaining_separators)
 
-    for split in splits:
-        candidate = split if not current else f"{current}{joiner}{split}"
-        if len(candidate) <= chunk_size:
-            current = candidate
+    spans = []
+    current_start = 0
+    current_end = 0
+
+    for split_end in split_points + [len(text)]:
+        if split_end - current_start <= chunk_size:
+            current_end = split_end
             continue
 
-        if current.strip():
-            chunks.extend(split_long_text(current.strip(), chunk_size, remaining_separators))
-        current = split
+        if current_end > current_start:
+            spans.extend(
+                split_long_span(
+                    text[current_start:current_end],
+                    start_offset + current_start,
+                    chunk_size,
+                    remaining_separators,
+                )
+            )
+            current_start = current_end
 
-    if current.strip():
-        chunks.extend(split_long_text(current.strip(), chunk_size, remaining_separators))
+        if split_end - current_start > chunk_size:
+            spans.extend(
+                split_long_span(
+                    text[current_start:split_end],
+                    start_offset + current_start,
+                    chunk_size,
+                    remaining_separators,
+                )
+            )
+            current_start = split_end
 
-    return chunks
+        current_end = split_end
+
+    if current_end > current_start:
+        spans.extend(
+            split_long_span(
+                text[current_start:current_end],
+                start_offset + current_start,
+                chunk_size,
+                remaining_separators,
+            )
+        )
+
+    return spans
 
 
-def split_long_text(text: str, chunk_size: int, separators: list[str]) -> list[str]:
+def split_long_span(text: str, start_offset: int, chunk_size: int, separators: list[str]) -> list[dict]:
     if len(text) <= chunk_size:
-        return [text]
-    if not separators:
-        return [text[start : start + chunk_size].strip() for start in range(0, len(text), chunk_size)]
-    return recursive_split_text(text, chunk_size, separators)
+        span = make_chunk_span(text, start_offset, start_offset + len(text), base_offset=start_offset)
+        return [span] if span else []
+    return recursive_split_spans(text, start_offset, chunk_size, separators)
 
 
-def add_overlap(chunks: list[str], overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[str]:
-    if overlap <= 0 or len(chunks) <= 1:
-        return chunks
+def align_to_text_boundary(text: str, start: int, limit: int = 40) -> int:
+    if start <= 0 or start >= len(text):
+        return max(0, min(start, len(text)))
+    if text[start].isspace() or text[start - 1].isspace():
+        return start
 
-    overlapped = [chunks[0]]
-    for previous, chunk in zip(chunks, chunks[1:]):
-        prefix = previous[-overlap:].strip()
-        overlapped.append(f"{prefix}\n{chunk}" if prefix else chunk)
+    search_start = max(0, start - limit)
+    for idx in range(start - 1, search_start - 1, -1):
+        if text[idx].isspace():
+            return idx + 1
+
+    search_end = min(len(text), start + limit)
+    for idx in range(start, search_end):
+        if text[idx].isspace():
+            return idx + 1
+    return start
+
+
+def add_overlap_spans(text: str, spans: list[dict], overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[dict]:
+    if overlap <= 0:
+        return spans
+
+    overlapped = []
+    previous_end = 0
+    for idx, span in enumerate(spans):
+        start = span["start"] if idx == 0 else align_to_text_boundary(text, max(0, previous_end - overlap))
+        overlapped_span = make_chunk_span(text, start, span["end"])
+        if overlapped_span:
+            overlapped.append(overlapped_span)
+        previous_end = span["end"]
     return overlapped
 
 
-def chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[str]:
-    chunks = recursive_split_text(text, chunk_size=chunk_size)
-    return add_overlap([chunk.strip() for chunk in chunks if chunk.strip()], overlap=overlap)
+def chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[dict]:
+    spans = recursive_split_spans(text, chunk_size=chunk_size)
+    return add_overlap_spans(text, spans, overlap=overlap)
 
 
 def is_section_heading(line: str) -> bool:
@@ -187,6 +270,78 @@ def infer_doc_type(pdf_path: str | None) -> str:
     if re.search(r"p\d{2}d\d+", name):
         return "datasheet"
     return "document"
+
+
+def extract_product(source: str, text: str) -> str:
+    candidates = []
+    candidates.extend(re.findall(r"\bP\d{2}D\d{5}(?:-\d{2}(?:-[A-Z0-9]+)?)?\b", source.upper()))
+    candidates.extend(re.findall(r"\b(?:RK\d{4}|STM32[A-Z0-9]+|RTL\d+[A-Z0-9]*|RZ/[A-Z0-9]+)\b", text, flags=re.IGNORECASE))
+
+    imx_match = re.search(r"\bi\.MX[0-9A-Za-z]+(?:\s+\w+)?\b", text)
+    if imx_match:
+        candidates.append(imx_match.group(0))
+
+    for candidate in candidates:
+        normalized = re.sub(r"\s+", " ", candidate).strip()
+        if normalized:
+            return normalized
+    return ""
+
+
+def extract_version(text: str) -> str:
+    patterns = [
+        r"\bFW\s*v?\d+(?:\.\d+){1,3}\b",
+        r"\bFirmware\s*v?\d+(?:\.\d+){1,3}\b",
+        r"\bYocto\s+\d+(?:\.\d+){1,2}\b",
+        r"\bAndroid\s+\d+(?:\.\d+){0,2}\b",
+        r"\bv\d+(?:\.\d+){1,3}\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def extract_tags(text: str) -> list[str]:
+    tag_keywords = {
+        "firmware": r"\b(?:firmware|fw)\b",
+        "upgrade": r"\b(?:upgrade|update)\b",
+        "hardware": r"\bhardware\b",
+        "software": r"\bsoftware\b",
+        "ethernet": r"\bethernet\b",
+        "usb": r"\busb\b",
+        "display": r"\b(?:display|hdmi|lvds|mipi|dsi)\b",
+        "camera": r"\b(?:camera|csi)\b",
+        "memory": r"\b(?:memory|ram|flash|emmc)\b",
+        "power": r"\bpower\b",
+        "gpio": r"\bgpio",
+    }
+    return [tag for tag, pattern in tag_keywords.items() if re.search(pattern, text, flags=re.IGNORECASE)]
+
+
+def extract_faq_pairs(text: str) -> list[dict]:
+    pattern = re.compile(
+        r"(?ims)^\s*(?:Q|Question)\s*[:：]\s*(?P<question>.*?)"
+        r"^\s*(?:A|Answer)\s*[:：]\s*(?P<answer>.*?)(?=^\s*(?:Q|Question)\s*[:：]|\Z)"
+    )
+    pairs = []
+    for match in pattern.finditer(text):
+        question = normalize_text(match.group("question"))
+        answer = normalize_text(match.group("answer"))
+        if not question or not answer:
+            continue
+        pair_text = f"Q: {question}\nA: {answer}"
+        pairs.append(
+            {
+                "text": pair_text,
+                "question": question,
+                "answer": answer,
+                "start": match.start(),
+                "end": match.end(),
+            }
+        )
+    return pairs
 
 
 def detect_language(text: str) -> str:
@@ -235,6 +390,58 @@ def find_chunk_pages(chunk: str, document_text: str, page_spans: list[dict], sea
     return matched_pages[0], matched_pages[-1], chunk_start
 
 
+def find_pages_for_span(start: int, end: int, page_spans: list[dict]) -> tuple[int, int]:
+    matched_pages = [
+        span["page"]
+        for span in page_spans
+        if span["start"] < end and span["end"] > start
+    ]
+    if not matched_pages:
+        nearest = min(page_spans, key=lambda span: abs(span["start"] - start))
+        matched_pages = [nearest["page"]]
+    return matched_pages[0], matched_pages[-1]
+
+
+def build_chunk_record(
+    source: str,
+    file_path: str,
+    idx: int,
+    chunk: dict,
+    page_spans: list[dict],
+    doc_type: str,
+) -> dict:
+    start_page, end_page = find_pages_for_span(chunk["start"], chunk["end"], page_spans)
+    title, section = extract_title_and_section(chunk["text"])
+    product = extract_product(source, chunk["text"])
+    version = extract_version(chunk["text"])
+
+    record = {
+        "chunk_id": f"{source}-p{start_page}-{end_page}-c{idx}",
+        "source": source,
+        "file_path": file_path,
+        "page": start_page,
+        "start_page": start_page,
+        "end_page": end_page,
+        "char_start": chunk["start"],
+        "char_end": chunk["end"],
+        "chunk_index": idx,
+        "section": section,
+        "title": title,
+        "doc_type": doc_type,
+        "product": product,
+        "version": version,
+        "language": detect_language(chunk["text"]),
+        "tags": extract_tags(chunk["text"]),
+        "text": chunk["text"],
+    }
+
+    if "question" in chunk:
+        record["question"] = chunk["question"]
+        record["answer"] = chunk["answer"]
+
+    return record
+
+
 def build_chunks(pages: list[dict], chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[dict]:
     chunk_records = []
     pages_by_source: dict[str, list[dict]] = {}
@@ -245,30 +452,14 @@ def build_chunks(pages: list[dict], chunk_size: int = DEFAULT_CHUNK_SIZE, overla
     for source, source_pages in pages_by_source.items():
         source_pages = sorted(source_pages, key=lambda item: item["page"])
         document_text, page_spans = build_document_text(source_pages)
-        chunks = chunk_text(document_text, chunk_size=chunk_size, overlap=overlap)
         file_path = source_pages[0].get("file_path", "")
-        search_start = 0
+        doc_type = infer_doc_type(file_path)
+        chunks = extract_faq_pairs(document_text) if doc_type == "faq" else []
+        if not chunks:
+            chunks = chunk_text(document_text, chunk_size=chunk_size, overlap=overlap)
 
         for idx, chunk in enumerate(chunks, start=1):
-            start_page, end_page, chunk_start = find_chunk_pages(chunk, document_text, page_spans, search_start)
-            search_start = max(chunk_start + 1, search_start)
-            title, section = extract_title_and_section(chunk)
-            chunk_records.append(
-                {
-                    "chunk_id": f"{source}-p{start_page}-{end_page}-c{idx}",
-                    "source": source,
-                    "file_path": file_path,
-                    "page": start_page,
-                    "start_page": start_page,
-                    "end_page": end_page,
-                    "chunk_index": idx,
-                    "section": section,
-                    "title": title,
-                    "doc_type": infer_doc_type(file_path),
-                    "language": detect_language(chunk),
-                    "text": chunk,
-                }
-            )
+            chunk_records.append(build_chunk_record(source, file_path, idx, chunk, page_spans, doc_type))
 
     return chunk_records
 

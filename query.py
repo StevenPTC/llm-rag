@@ -111,11 +111,16 @@ def search_chroma(question: str, top_k: int, embed_model: str) -> list[dict]:
                 "page": metadata["page"],
                 "start_page": metadata.get("start_page", metadata["page"]),
                 "end_page": metadata.get("end_page", metadata["page"]),
+                "char_start": metadata.get("char_start", 0),
+                "char_end": metadata.get("char_end", 0),
                 "chunk_index": metadata["chunk_index"],
                 "section": metadata.get("section", ""),
                 "title": metadata.get("title", ""),
                 "doc_type": metadata.get("doc_type", ""),
+                "product": metadata.get("product", ""),
+                "version": metadata.get("version", ""),
                 "language": metadata.get("language", ""),
+                "tags": [tag for tag in metadata.get("tags", "").split(",") if tag],
                 "text": document,
                 "score": float(distance),
             }
@@ -131,7 +136,12 @@ def print_results(results: list[dict]) -> None:
         page_label = start_page if start_page == end_page else f"{start_page}-{end_page}"
         section = item.get("section") or item.get("title") or ""
         section_label = f" section={section}" if section else ""
-        print(f"[{idx}] score={item['score']:.4f} source={item['source']} page={page_label}{section_label}")
+        product_label = f" product={item['product']}" if item.get("product") else ""
+        version_label = f" version={item['version']}" if item.get("version") else ""
+        print(
+            f"[{idx}] score={item['score']:.4f} source={item['source']} "
+            f"page={page_label}{section_label}{product_label}{version_label}"
+        )
         print(item["text"])
         print()
 
