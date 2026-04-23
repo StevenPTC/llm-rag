@@ -32,14 +32,55 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def extract_table_texts_with_pdfplumber(pdf_path: Path) -> dict[int, list[str]]:
+    try:
+        import pdfplumber
+    except ImportError:
+        return {}
+
+    table_texts: dict[int, list[str]] = {}
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_index, page in enumerate(pdf.pages, start=1):
+            page_tables = []
+            for table in page.extract_tables() or []:
+                rows = []
+                for row in table:
+                    cells = [(cell or "").strip() for cell in row]
+                    if any(cells):
+                        rows.append(" | ".join(cells))
+                if rows:
+                    page_tables.append("\n".join(rows))
+            if page_tables:
+                table_texts[page_index] = page_tables
+    return table_texts
+
+
+def extract_structured_page_text(page: fitz.Page, table_texts: list[str] | None = None) -> str:
+    blocks = page.get_text("blocks", sort=True)
+    parts = []
+
+    for block in blocks:
+        text = normalize_text(block[4] if len(block) > 4 else "")
+        if not text:
+            continue
+        parts.append(text)
+
+    if table_texts:
+        for idx, table_text in enumerate(table_texts, start=1):
+            parts.append(f"[TABLE {idx}]\n{normalize_text(table_text)}")
+
+    return normalize_text("\n\n".join(parts))
+
+
 def extract_pdf_pages(pdf_path: Path) -> list[dict]:
+    table_texts = extract_table_texts_with_pdfplumber(pdf_path)
     with fitz.open(pdf_path) as doc:
         raw_pages = [
             {
                 "source": pdf_path.name,
                 "file_path": str(pdf_path),
                 "page": i + 1,
-                "text": normalize_text(page.get_text("text")),
+                "text": extract_structured_page_text(page, table_texts.get(i + 1, [])),
             }
             for i, page in enumerate(doc)
         ]
@@ -259,6 +300,43 @@ def extract_title_and_section(text: str) -> tuple[str, str]:
     return title[:120], section[:120]
 
 
+def extract_heading_level(text: str) -> int:
+    first_nonempty = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if not first_nonempty:
+        return 0
+
+    numbered = re.match(r"^(\d+(?:\.\d+)*)", first_nonempty)
+    if numbered:
+        return numbered.group(1).count(".") + 1
+    if first_nonempty.isupper() and len(first_nonempty.split()) <= 8:
+        return 1
+    if is_section_heading(first_nonempty):
+        return 2
+    return 0
+
+
+def extract_list_structure(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    bullet_count = sum(bool(re.match(r"^(?:[-*•]|[0-9]+[.)]|[A-Za-z][.)])\s+", line)) for line in lines)
+    if bullet_count >= 3:
+        return "list"
+    if bullet_count >= 1:
+        return "mixed"
+    return ""
+
+
+def extract_table_context(text: str) -> str:
+    if "[TABLE" in text:
+        return "extracted_table"
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    pipe_lines = sum("|" in line for line in lines)
+    spaced_columns = sum(bool(re.search(r"\S\s{2,}\S", line)) for line in lines)
+    if pipe_lines >= 2 or spaced_columns >= 3:
+        return "table_like_layout"
+    return ""
+
+
 def infer_doc_type(pdf_path: str | None) -> str:
     if not pdf_path:
         return "document"
@@ -414,6 +492,9 @@ def build_chunk_record(
     title, section = extract_title_and_section(chunk["text"])
     product = extract_product(source, chunk["text"])
     version = extract_version(chunk["text"])
+    heading_level = extract_heading_level(chunk["text"])
+    list_structure = extract_list_structure(chunk["text"])
+    table_context = extract_table_context(chunk["text"])
 
     record = {
         "chunk_id": f"{source}-p{start_page}-{end_page}-c{idx}",
@@ -430,6 +511,9 @@ def build_chunk_record(
         "doc_type": doc_type,
         "product": product,
         "version": version,
+        "heading_level": heading_level,
+        "list_structure": list_structure,
+        "table_context": table_context,
         "language": detect_language(chunk["text"]),
         "tags": extract_tags(chunk["text"]),
         "text": chunk["text"],
@@ -460,6 +544,11 @@ def build_chunks(pages: list[dict], chunk_size: int = DEFAULT_CHUNK_SIZE, overla
 
         for idx, chunk in enumerate(chunks, start=1):
             chunk_records.append(build_chunk_record(source, file_path, idx, chunk, page_spans, doc_type))
+
+        source_chunk_records = chunk_records[-len(chunks):]
+        for idx, record in enumerate(source_chunk_records):
+            record["prev_chunk_id"] = source_chunk_records[idx - 1]["chunk_id"] if idx > 0 else ""
+            record["next_chunk_id"] = source_chunk_records[idx + 1]["chunk_id"] if idx + 1 < len(source_chunk_records) else ""
 
     return chunk_records
 

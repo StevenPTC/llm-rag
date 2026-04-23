@@ -16,6 +16,7 @@ FAISS_INDEX_PATH = DATA_DIR / "faiss.index"
 FAISS_METADATA_PATH = DATA_DIR / "faiss_metadata.jsonl"
 CHROMA_DIR = DATA_DIR / "chroma_db"
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_OPENAI_CHAT_MODEL = "gpt-4.1-mini"
 DEFAULT_CHAT_MODEL = "qwen3.5:9b"
 DEFAULT_LLM_PROVIDER = "ollama"
@@ -49,6 +50,17 @@ def get_sentence_transformer(model_name: str = DEFAULT_EMBED_MODEL):
         ) from exc
 
     return SentenceTransformer(model_name)
+
+
+def get_cross_encoder(model_name: str = DEFAULT_RERANK_MODEL):
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError as exc:
+        raise ImportError(
+            "Missing package: sentence-transformers. Install with `pip install sentence-transformers`."
+        ) from exc
+
+    return CrossEncoder(model_name)
 
 
 def embed_texts(
@@ -181,8 +193,16 @@ def format_contexts(results: list[dict]) -> str:
             metadata_lines.append(f"product: {item['product']}")
         if item.get("version"):
             metadata_lines.append(f"version: {item['version']}")
+        if item.get("heading_level") is not None:
+            metadata_lines.append(f"heading_level: {item['heading_level']}")
+        if item.get("list_structure"):
+            metadata_lines.append(f"list_structure: {item['list_structure']}")
+        if item.get("table_context"):
+            metadata_lines.append(f"table_context: {item['table_context']}")
         if item.get("char_start") is not None and item.get("char_end") is not None:
             metadata_lines.append(f"char_range: {item['char_start']}-{item['char_end']}")
+        if item.get("is_adjacent"):
+            metadata_lines.append("retrieval_role: adjacent_supporting_chunk")
         metadata_lines.append(f"text: {item['text']}")
         blocks.append(
             "\n".join(metadata_lines)
@@ -193,9 +213,21 @@ def format_contexts(results: list[dict]) -> str:
 def build_prompt(question: str, results: list[dict]) -> str:
     context_text = format_contexts(results)
     return (
-        "You are a helpful RAG assistant. Answer only from the provided context. "
-        "If the context is insufficient, say you do not know.\n\n"
+        "You are a retrieval-augmented assistant. Answer only from the provided context. "
+        "You must synthesize information across multiple contexts when needed instead of relying on a single chunk. "
+        "If the evidence is incomplete or conflicting, say so explicitly.\n\n"
         f"Question: {question}\n\n"
         f"Context:\n{context_text}\n\n"
-        "Please answer in Traditional Chinese and cite the source filename and page number when possible."
+        "Instructions:\n"
+        "1. Read all contexts before answering.\n"
+        "2. Merge adjacent or related contexts when the answer spans multiple chunks.\n"
+        "3. Do not invent facts outside the context.\n"
+        "4. Prefer the most specific evidence such as tables, lists, versions, and product names.\n"
+        "5. If the answer cannot be fully supported, state what is missing.\n\n"
+        "Output in Traditional Chinese with this structure:\n"
+        "Answer: <direct answer>\n"
+        "Evidence:\n"
+        "- <source filename + page + concise supporting fact>\n"
+        "- <source filename + page + concise supporting fact>\n"
+        "Notes: <optional caveat or missing information>"
     )

@@ -7,7 +7,8 @@
 - 中間產物放在 `data/`
 - 向量檢索預設使用 `FAISS`
 - 最終回答預設使用本機 `Ollama`，並在查詢時選擇本機已安裝模型
-- PDF 前處理會保留頁碼、章節、char range、產品、版本與 tags 等 metadata
+- PDF 前處理會保留頁碼、章節、char range、產品、版本、heading level、list/table context 與 tags 等 metadata
+- 查詢流程支援 `Dense Retrieval -> Hybrid Search -> Reranker -> Top K -> Adjacent Chunks -> LLM`
 
 ## 這個專案在做什麼
 
@@ -32,6 +33,8 @@ rag-project/
 ├─ embedding.py           # 將 chunks 轉成 embeddings
 ├─ index.py               # 建立向量索引（FAISS / Chroma）
 ├─ query.py               # 查詢 RAG
+├─ eval_retrieval.py      # 離線檢索評估
+├─ eval/                  # 評估資料集範例
 ├─ rag_utils.py           # 共用工具函式
 ├─ requirements.txt       # Python 套件需求
 └─ README.md
@@ -95,6 +98,14 @@ rag-project/
 - LLM provider: `ollama`
 - Chat model: 若未指定，會列出本機 Ollama 模型讓使用者選擇
 
+### `eval_retrieval.py`
+
+負責：
+- 讀取標註好的離線評估集
+- 比較 `dense` / `hybrid` / `rerank` / `final(with adjacent chunks)` 各階段表現
+- 計算 `Hit@K`、`MRR`、`mean first relevant rank`
+- 輸出 rerank 相對於 dense baseline 的改善幅度
+
 ## 安裝需求
 
 建議先啟用虛擬環境，再安裝套件：
@@ -107,6 +118,7 @@ pip install -r requirements.txt
 
 `requirements.txt` 包含：
 - `PyMuPDF`
+- `pdfplumber`
 - `numpy`
 - `sentence-transformers`
 - `faiss-cpu`
@@ -210,7 +222,10 @@ source .venv/bin/activate
 ```
 
 這會：
-- 先做向量檢索
+- 先做 dense retrieval（預設 top 20）
+- 再做 lexical hybrid merge
+- 再做 reranker 排序
+- 取 top 5 主 chunk，並自動補入相鄰 chunk
 - 印出 retrieved contexts
 - 列出本機 Ollama 模型讓你選擇
 - 再把 context 交給選到的模型回答
@@ -232,6 +247,69 @@ source .venv/bin/activate
 ```bash
 .venv/bin/python query.py "這份文件的 CPU 是什麼？" --retrieval-only
 ```
+
+如果想手動調整檢索策略：
+
+```bash
+.venv/bin/python query.py "Which product uses RK3568?" --dense-top-k 20 --top-k 5 --adjacent-window 1
+```
+
+如果想暫時關閉 hybrid 或 reranker 做比較：
+
+```bash
+.venv/bin/python query.py "Which product uses RK3568?" --disable-hybrid --retrieval-only
+.venv/bin/python query.py "Which product uses RK3568?" --disable-rerank --retrieval-only
+```
+
+### 5. 離線檢索評估
+
+先準備一份 JSONL 評估集，可參考：
+
+```bash
+eval/retrieval_eval.sample.jsonl
+```
+
+每一行格式：
+
+```json
+{"query":"Which product uses RK3568?","targets":[{"product":"RK3568"}]}
+```
+
+`targets` 支援的欄位包含：
+- `chunk_id`
+- `source`
+- `page`
+- `start_page`
+- `end_page`
+- `product`
+- `version`
+- `section`
+- `tags`
+- `text_contains`
+
+執行評估：
+
+```bash
+.venv/bin/python eval_retrieval.py --dataset eval/retrieval_eval.sample.jsonl
+```
+
+如果要輸出完整報表 JSON：
+
+```bash
+.venv/bin/python eval_retrieval.py --dataset eval/retrieval_eval.sample.jsonl --output data/retrieval_eval_report.json
+```
+
+輸出會比較：
+- `dense`
+- `hybrid`
+- `rerank`
+- `final`
+
+並顯示：
+- `Hit@1 / Hit@3 / Hit@5`
+- `MRR`
+- `mean first relevant rank`
+- `rerank` 與 `final` 相對 `dense` 的改善幅度
 
 如果想切到 Chroma：
 
@@ -375,7 +453,7 @@ curl http://localhost:11434/api/tags
 - `pyPDF.py` 的 `overlap`
 - `query.py` 的 `--top-k`
 - embedding model
-- 後續可加入 BM25 hybrid search 與 reranker
+- `eval_retrieval.py` 的離線標註集來量測真實改善幅度
 
 ### 4. `python3 pyPDF.py` 找不到 `fitz`
 

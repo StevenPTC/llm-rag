@@ -1,0 +1,3 @@
+{"query":"Which product uses RK3568?","targets":[{"product":"RK3568"}]}
+{"query":"這份文件的 CPU 是什麼？","targets":[{"source":"HIA128800T006-ZFC.pdf","page":1,"text_contains":"i.MX8M Mini"}]}
+{"query":"Which document mentions Yocto Linux?","targets":[{"source":"HIA128800T006-ZFC.pdf","section":"Software","text_contains":"Yocto Linux"}]}

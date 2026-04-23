@@ -64,6 +64,11 @@ def build_chroma_index() -> None:
             "language": record.get("language", ""),
             "tags": ",".join(record.get("tags", [])),
             "file_path": record.get("file_path", ""),
+            "heading_level": record.get("heading_level", 0),
+            "list_structure": record.get("list_structure", ""),
+            "table_context": record.get("table_context", ""),
+            "prev_chunk_id": record.get("prev_chunk_id", ""),
+            "next_chunk_id": record.get("next_chunk_id", ""),
         }
         for record in metadata
     ]
