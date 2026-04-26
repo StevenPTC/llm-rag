@@ -23,6 +23,45 @@ DEFAULT_LLM_PROVIDER = "ollama"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 
 
+def _metadata_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
+def build_metadata_aware_text(record: dict, content_key: str = "text") -> str:
+    fields = [
+        ("Title", record.get("title")),
+        ("Section", record.get("section")),
+        ("Product", record.get("product")),
+        ("Product codes", record.get("product_codes")),
+        ("Text product codes", record.get("text_product_codes")),
+        ("Source product codes", record.get("source_product_codes")),
+        ("Chip models", record.get("chip_models")),
+        ("Vendors", record.get("vendors")),
+        ("Version", record.get("version")),
+        ("Document type", record.get("doc_type")),
+        ("Tags", record.get("tags")),
+        ("Table context", record.get("table_context")),
+        ("List structure", record.get("list_structure")),
+    ]
+    lines = [f"{label}: {value}" for label, raw_value in fields if (value := _metadata_value(raw_value))]
+    content = _metadata_value(record.get(content_key))
+    if content:
+        lines.append(f"Content: {content}")
+    return "\n".join(lines)
+
+
+def build_embedding_text(record: dict) -> str:
+    return build_metadata_aware_text(record, content_key="text")
+
+
+def build_rerank_text(record: dict) -> str:
+    return build_metadata_aware_text(record, content_key="text")
+
+
 def load_jsonl(path: Path) -> list[dict]:
     with path.open("r", encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -191,6 +230,16 @@ def format_contexts(results: list[dict]) -> str:
             metadata_lines.append(f"section: {section}")
         if item.get("product"):
             metadata_lines.append(f"product: {item['product']}")
+        if item.get("product_codes"):
+            metadata_lines.append(f"product_codes: {_metadata_value(item['product_codes'])}")
+        if item.get("text_product_codes"):
+            metadata_lines.append(f"text_product_codes: {_metadata_value(item['text_product_codes'])}")
+        if item.get("source_product_codes"):
+            metadata_lines.append(f"source_product_codes: {_metadata_value(item['source_product_codes'])}")
+        if item.get("chip_models"):
+            metadata_lines.append(f"chip_models: {_metadata_value(item['chip_models'])}")
+        if item.get("vendors"):
+            metadata_lines.append(f"vendors: {_metadata_value(item['vendors'])}")
         if item.get("version"):
             metadata_lines.append(f"version: {item['version']}")
         if item.get("heading_level") is not None:
@@ -201,8 +250,16 @@ def format_contexts(results: list[dict]) -> str:
             metadata_lines.append(f"table_context: {item['table_context']}")
         if item.get("char_start") is not None and item.get("char_end") is not None:
             metadata_lines.append(f"char_range: {item['char_start']}-{item['char_end']}")
-        if item.get("is_adjacent"):
+        if item.get("context_id"):
+            metadata_lines.append(f"context_id: {item['context_id']}")
+        if item.get("matched_child_ids"):
+            metadata_lines.append(f"matched_child_ids: {', '.join(item['matched_child_ids'])}")
+        if item.get("retrieval_role"):
+            metadata_lines.append(f"retrieval_role: {item['retrieval_role']}")
+        elif item.get("is_adjacent"):
             metadata_lines.append("retrieval_role: adjacent_supporting_chunk")
+        if item.get("child_text") and item.get("child_text") != item.get("text"):
+            metadata_lines.append(f"matched_child_text: {item['child_text']}")
         metadata_lines.append(f"text: {item['text']}")
         blocks.append(
             "\n".join(metadata_lines)
@@ -223,7 +280,8 @@ def build_prompt(question: str, results: list[dict]) -> str:
         "2. Merge adjacent or related contexts when the answer spans multiple chunks.\n"
         "3. Do not invent facts outside the context.\n"
         "4. Prefer the most specific evidence such as tables, lists, versions, and product names.\n"
-        "5. If the answer cannot be fully supported, state what is missing.\n\n"
+        "5. If the question asks for product names or model names, extract only product/model names explicitly shown in the context. Do not answer unrelated specifications.\n"
+        "6. If the answer cannot be fully supported, state what is missing.\n\n"
         "Output in Traditional Chinese with this structure:\n"
         "Answer: <direct answer>\n"
         "Evidence:\n"

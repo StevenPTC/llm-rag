@@ -12,7 +12,9 @@ from rag_utils import (
     DEFAULT_RERANK_MODEL,
     FAISS_INDEX_PATH,
     METADATA_PATH,
+    build_embedding_text,
     build_prompt,
+    build_rerank_text,
     call_ollama_chat,
     embed_texts,
     ensure_openai_client,
@@ -24,12 +26,30 @@ from rag_utils import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Query the RAG system")
-    parser.add_argument("question", help="Question to ask")
+    parser.add_argument("question", nargs="?", help="Question to ask")
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Start an interactive prompt for asking multiple questions",
+    )
     parser.add_argument("--backend", choices=["faiss", "chroma"], default="faiss", help="Vector store backend")
     parser.add_argument("--top-k", type=int, default=5, help="Final number of primary chunks after reranking")
+    parser.add_argument(
+        "--product-list-top-k",
+        type=int,
+        default=20,
+        help="Maximum number of unique product contexts for vendor/product listing questions",
+    )
     parser.add_argument("--dense-top-k", type=int, default=20, help="Number of dense retrieval candidates")
     parser.add_argument("--hybrid-top-k", type=int, default=20, help="Number of candidates kept after hybrid merge")
     parser.add_argument("--adjacent-window", type=int, default=1, help="How many adjacent chunks to include per selected chunk")
+    parser.add_argument(
+        "--parent-context-tokens",
+        type=int,
+        default=700,
+        help="Maximum compact parent-context token window passed to the LLM for each final context",
+    )
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="Embedding model name")
     parser.add_argument("--reranker-model", default=DEFAULT_RERANK_MODEL, help="Cross-encoder reranker model name")
     parser.add_argument("--disable-hybrid", action="store_true", help="Disable lexical+dense hybrid retrieval")
@@ -135,7 +155,7 @@ def lexical_search(question: str, records: list[dict], top_k: int) -> list[dict]
     if not query_tokens:
         return []
 
-    document_tokens = [tokenize(record.get("text", "")) for record in records]
+    document_tokens = [tokenize(build_embedding_text(record)) for record in records]
     avg_doc_len = sum(len(tokens) for tokens in document_tokens) / max(len(document_tokens), 1)
     doc_freq = Counter()
     for tokens in document_tokens:
@@ -199,9 +219,287 @@ def reciprocal_rank_fusion(dense_results: list[dict], lexical_results: list[dict
     return ranked[:top_k]
 
 
+def detect_requested_vendors(question: str) -> list[str]:
+    vendors = []
+    if re.search(r"(?i)(?:^|[^a-z0-9])ST(?:$|[^a-z0-9])", question) or re.search(r"(?i)\bSTM32", question):
+        vendors.append("ST")
+    if re.search(r"(?i)\b(?:Rockchip|RK\d{4})\b", question):
+        vendors.append("Rockchip")
+    if re.search(r"(?i)\b(?:NXP|i\.MX)", question):
+        vendors.append("NXP")
+    if re.search(r"(?i)\b(?:Realtek|RTL\d+)", question):
+        vendors.append("Realtek")
+    if re.search(r"(?i)\b(?:Renesas|RZ/)", question):
+        vendors.append("Renesas")
+    return vendors
+
+
+def detect_requested_chip_models(question: str) -> list[str]:
+    chips = [
+        match.upper()
+        for match in re.findall(
+            r"\b(?:RK\d{4}[A-Z0-9]*|STM32[A-Z0-9]+|RTL\d+[A-Z0-9]*|RZ/[A-Z0-9]+)\b",
+            question,
+            flags=re.IGNORECASE,
+        )
+    ]
+    chips.extend(match for match in re.findall(r"\bi\.MX[0-9A-Za-z]+(?:\s+\w+)?\b", question, flags=re.IGNORECASE))
+    return list(dict.fromkeys(chips))
+
+
+def asks_for_product_list(question: str) -> bool:
+    return bool(re.search(r"(?i)(產品|型號|有哪些|列出|尋找|list|which|what|product|model)", question))
+
+
+def metadata_query_bonus(question: str, item: dict) -> float:
+    requested_vendors = detect_requested_vendors(question)
+    requested_chips = set(detect_requested_chip_models(question))
+    if not requested_vendors and not requested_chips:
+        return 0.0
+
+    item_vendors = set(item.get("vendors", []))
+    item_chips = set(item.get("chip_models", []))
+    list_intent = asks_for_product_list(question)
+    bonus = 0.0
+
+    if requested_chips:
+        if requested_chips.intersection(item_chips):
+            bonus += 8.0 if list_intent else 4.0
+        elif item_chips:
+            bonus -= 8.0 if list_intent else 4.0
+
+    for vendor in requested_vendors:
+        if vendor in item_vendors:
+            bonus += 6.0 if list_intent else 3.0
+        else:
+            bonus -= 6.0 if list_intent else 3.0
+
+    if list_intent and (item.get("product_codes") or item.get("chip_models") or item.get("product")):
+        bonus += 1.0
+    if item.get("product_codes") and item.get("chip_models"):
+        bonus += 0.5
+
+    return bonus
+
+
+def add_metadata_vendor_candidates(question: str, records: list[dict], candidates: list[dict]) -> list[dict]:
+    requested_vendors = set(detect_requested_vendors(question))
+    requested_chips = set(detect_requested_chip_models(question))
+    if not (requested_vendors or requested_chips) or not asks_for_product_list(question):
+        return candidates
+
+    merged = {item["chunk_id"]: item.copy() for item in candidates}
+    base_score = max((item.get("hybrid_score", item.get("dense_score", 0.0)) for item in candidates), default=0.0)
+
+    for record in records:
+        if requested_chips and not requested_chips.intersection(record.get("chip_models", [])):
+            continue
+        if requested_vendors and not requested_vendors.intersection(record.get("vendors", [])):
+            continue
+        if not (record.get("product") or record.get("product_codes") or record.get("chip_models")):
+            continue
+        if record["chunk_id"] in merged:
+            merged[record["chunk_id"]]["metadata_vendor_match"] = True
+            continue
+
+        item = record.copy()
+        item["dense_score"] = 0.0
+        item["lexical_score"] = 0.0
+        item["hybrid_score"] = base_score + metadata_query_bonus(question, item)
+        item["metadata_vendor_match"] = True
+        merged[item["chunk_id"]] = item
+
+    ranked = sorted(
+        merged.values(),
+        key=lambda item: (
+            item.get("metadata_vendor_match", False),
+            item.get("hybrid_score", item.get("dense_score", 0.0)),
+        ),
+        reverse=True,
+    )
+    for rank, item in enumerate(ranked, start=1):
+        item["hybrid_rank"] = rank
+    return ranked
+
+
+def product_identity_key(item: dict) -> str:
+    if item.get("product_codes"):
+        return "|".join(item["product_codes"])
+    if item.get("source"):
+        return item["source"]
+    if item.get("chip_models"):
+        return "|".join(item["chip_models"])
+    return item["chunk_id"]
+
+
+def unique_list_values(items: list[dict], key: str) -> list[str]:
+    seen = set()
+    values = []
+    for item in items:
+        for value in item.get(key, []):
+            normalized = str(value).strip()
+            if not normalized:
+                continue
+            lookup_key = normalized.upper()
+            if lookup_key in seen:
+                continue
+            seen.add(lookup_key)
+            values.append(normalized)
+    return values
+
+
+def select_final_primary_results(question: str, reranked_results: list[dict], args: argparse.Namespace) -> list[dict]:
+    requested_vendors = set(detect_requested_vendors(question))
+    requested_chips = set(detect_requested_chip_models(question))
+    if not (requested_vendors or requested_chips) or not asks_for_product_list(question):
+        return reranked_results[: args.top_k]
+
+    limit = max(args.top_k, getattr(args, "product_list_top_k", 20))
+    selected = []
+    seen_products = set()
+
+    for item in reranked_results:
+        if requested_chips and not requested_chips.intersection(item.get("chip_models", [])):
+            continue
+        if requested_vendors and not requested_vendors.intersection(item.get("vendors", [])):
+            continue
+        key = product_identity_key(item)
+        if key in seen_products:
+            continue
+        selected.append(item)
+        seen_products.add(key)
+        if len(selected) >= limit:
+            break
+
+    return selected or reranked_results[: args.top_k]
+
+
+def answer_product_list_from_metadata(question: str, results: list[dict]) -> str:
+    requested_vendors = set(detect_requested_vendors(question))
+    requested_chips = set(detect_requested_chip_models(question))
+    source_text_codes = {}
+    for item in results:
+        text_codes = item.get("text_product_codes", [])
+        if text_codes:
+            source_text_codes.setdefault(item.get("source", ""), set()).update(text_codes)
+
+    rows_by_key = {}
+    row_order = []
+
+    for item in results:
+        vendors = item.get("vendors", [])
+        chips = item.get("chip_models", [])
+        if requested_vendors and not requested_vendors.intersection(vendors):
+            continue
+        if requested_chips and not requested_chips.intersection(chips):
+            continue
+
+        source = item.get("source", "")
+        text_codes = item.get("text_product_codes", [])
+        if source_text_codes.get(source) and not text_codes and item.get("source_product_codes"):
+            continue
+
+        codes = text_codes or item.get("product_codes", [])
+        code = codes[0] if codes else item.get("source", "").removesuffix(".pdf")
+        chip = chips[0] if chips else item.get("product", "")
+        if not code and not chip:
+            continue
+
+        key = code.upper() if code else chip.upper()
+        existing = rows_by_key.get(key)
+        if existing and (existing["chip"] or not chip):
+            continue
+        if key not in rows_by_key:
+            row_order.append(key)
+        rows_by_key[key] = {"code": code, "chip": chip, "source": source, "page": item.get("page", "")}
+
+    vendor_label = " / ".join(sorted(requested_vendors)) if requested_vendors else "指定"
+    if not rows_by_key:
+        return f"Answer: 目前提供的 context 中沒有找到明確的 {vendor_label} 相關產品。"
+
+    lines = [f"Answer: 目前找到的 {vendor_label} 相關產品如下："]
+    for idx, key in enumerate(row_order, start=1):
+        row = rows_by_key[key]
+        code = row["code"]
+        chip = row["chip"]
+        source = row["source"]
+        page = row["page"]
+        product_label = f"{code} — {chip}" if chip and chip != code else code or chip
+        page_label = f" 第 {page} 頁" if page != "" else ""
+        lines.append(f"{idx}. {product_label}，來源：{source}{page_label}")
+    return "\n".join(lines)
+
+
+def token_spans(text: str) -> list[dict]:
+    return [
+        {"start": match.start(), "end": match.end()}
+        for match in re.finditer(r"[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)*|[\u4e00-\u9fff]|[^\s]", text)
+    ]
+
+
+def compact_text_window(text: str, start: int, end: int, max_tokens: int) -> str:
+    spans = token_spans(text)
+    if not spans or len(spans) <= max_tokens:
+        return text.strip()
+
+    start = max(0, min(start, len(text)))
+    end = max(start, min(end, len(text)))
+    first_token = 0
+    while first_token < len(spans) and spans[first_token]["end"] <= start:
+        first_token += 1
+
+    last_token = first_token
+    while last_token < len(spans) and spans[last_token]["start"] < end:
+        last_token += 1
+
+    core_count = max(last_token - first_token, 1)
+    budget = max(max_tokens, core_count)
+    remaining = max(budget - core_count, 0)
+    left_extra = remaining // 2
+    right_extra = remaining - left_extra
+    window_start = max(0, first_token - left_extra)
+    window_end = min(len(spans), last_token + right_extra)
+
+    if window_end - window_start < budget:
+        shortage = budget - (window_end - window_start)
+        window_start = max(0, window_start - shortage)
+        window_end = min(len(spans), window_end + shortage)
+
+    char_start = spans[window_start]["start"]
+    char_end = spans[window_end - 1]["end"]
+    prefix = "[...]\n" if window_start > 0 else ""
+    suffix = "\n[...]" if window_end < len(spans) else ""
+    return f"{prefix}{text[char_start:char_end].strip()}{suffix}"
+
+
+def compact_parent_context(seed: dict, child_items: list[dict], max_tokens: int) -> str:
+    parent_text = seed.get("parent_text") or seed.get("text", "")
+    parent_start = seed.get("parent_char_start", seed.get("char_start", 0))
+    ranges = []
+
+    for item in child_items:
+        if item.get("char_start") is None or item.get("char_end") is None:
+            continue
+        ranges.append(
+            (
+                max(0, item["char_start"] - parent_start),
+                max(0, item["char_end"] - parent_start),
+            )
+        )
+
+    if not parent_text:
+        return "\n\n".join(item.get("text", "") for item in child_items if item.get("text"))
+    if not ranges:
+        return parent_text.strip()
+
+    start = min(item[0] for item in ranges)
+    end = max(item[1] for item in ranges)
+    return compact_text_window(parent_text, start, end, max_tokens=max_tokens)
+
+
 def heuristic_rerank_score(question: str, item: dict) -> float:
     query_tokens = set(tokenize(question))
-    text_tokens = tokenize(item.get("text", ""))
+    text_tokens = tokenize(build_rerank_text(item))
     overlap = len(query_tokens.intersection(text_tokens))
     metadata_bonus = 0.0
 
@@ -210,6 +508,9 @@ def heuristic_rerank_score(question: str, item: dict) -> float:
             item.get("section", ""),
             item.get("title", ""),
             item.get("product", ""),
+            " ".join(item.get("product_codes", [])),
+            " ".join(item.get("chip_models", [])),
+            " ".join(item.get("vendors", [])),
             item.get("version", ""),
             " ".join(item.get("tags", [])),
             item.get("table_context", ""),
@@ -226,7 +527,13 @@ def heuristic_rerank_score(question: str, item: dict) -> float:
     if item.get("heading_level"):
         structural_bonus += 0.05
 
-    return float(item.get("hybrid_score", item.get("dense_score", 0.0))) + overlap * 0.15 + metadata_bonus * 0.1 + structural_bonus
+    return (
+        float(item.get("hybrid_score", item.get("dense_score", 0.0)))
+        + metadata_query_bonus(question, item)
+        + overlap * 0.15
+        + metadata_bonus * 0.1
+        + structural_bonus
+    )
 
 
 def rerank_results(question: str, candidates: list[dict], reranker_model: str) -> list[dict]:
@@ -235,12 +542,12 @@ def rerank_results(question: str, candidates: list[dict], reranker_model: str) -
 
     try:
         reranker = get_cross_encoder(reranker_model)
-        pairs = [(question, item["text"]) for item in candidates]
+        pairs = [(question, build_rerank_text(item)) for item in candidates]
         scores = reranker.predict(pairs)
         reranked = []
         for item, score in zip(candidates, scores):
             updated = item.copy()
-            updated["rerank_score"] = float(score)
+            updated["rerank_score"] = float(score) + metadata_query_bonus(question, updated)
             reranked.append(updated)
         reranked.sort(key=lambda item: item["rerank_score"], reverse=True)
     except Exception:
@@ -270,21 +577,73 @@ def retrieve_stages(question: str, args: argparse.Namespace) -> dict[str, list[d
         lexical_results = lexical_search(question, records, args.dense_top_k)
         hybrid_results = reciprocal_rank_fusion(dense_results, lexical_results, args.hybrid_top_k)
 
+    hybrid_results = add_metadata_vendor_candidates(question, records, hybrid_results)
+    rerank_candidates = hybrid_results
+
     if args.disable_rerank:
-        reranked_results = hybrid_results[: args.top_k]
+        reranked_results = hybrid_results
         for rank, item in enumerate(reranked_results, start=1):
             item["rerank_score"] = item.get("hybrid_score", item.get("dense_score", 0.0))
             item["rerank_rank"] = rank
     else:
-        reranked_results = rerank_results(question, hybrid_results, args.reranker_model)
+        reranked_results = rerank_results(question, rerank_candidates, args.reranker_model)
 
-    final_results = expand_adjacent_chunks(reranked_results[: args.top_k], metadata_by_id, args.adjacent_window)
+    final_primary_results = select_final_primary_results(question, reranked_results, args)
+    final_seed_results = expand_adjacent_chunks(final_primary_results, metadata_by_id, args.adjacent_window)
+
+    final_results = materialize_parent_contexts(final_seed_results, getattr(args, "parent_context_tokens", 700))
     return {
         "dense": dense_results,
         "hybrid": hybrid_results,
         "rerank": reranked_results,
         "final": final_results,
     }
+
+
+def materialize_parent_contexts(results: list[dict], parent_context_tokens: int = 700) -> list[dict]:
+    contexts = []
+    by_parent_id: dict[str, dict] = {}
+
+    for item in results:
+        parent_id = item.get("parent_id") or item["chunk_id"]
+        if parent_id in by_parent_id:
+            existing = by_parent_id[parent_id]
+            existing["_child_items"].append(item)
+            existing["rerank_score"] = max(existing.get("rerank_score", 0.0), item.get("rerank_score", 0.0))
+            continue
+
+        context = item.copy()
+        context["context_id"] = parent_id
+        context["retrieval_role"] = "compact_parent_context"
+        context["_child_items"] = [item]
+
+        by_parent_id[parent_id] = context
+        contexts.append(context)
+
+    for context in contexts:
+        child_items = sorted(context.pop("_child_items"), key=lambda item: item.get("char_start", 0))
+        context["matched_child_ids"] = [item["chunk_id"] for item in child_items]
+        context["matched_child_texts"] = [item.get("text", "") for item in child_items if item.get("text")]
+        context["child_text"] = "\n\n".join(context["matched_child_texts"])
+        context["product_codes"] = unique_list_values(child_items, "product_codes")
+        context["text_product_codes"] = unique_list_values(child_items, "text_product_codes")
+        context["source_product_codes"] = unique_list_values(child_items, "source_product_codes")
+        context["chip_models"] = unique_list_values(child_items, "chip_models")
+        context["vendors"] = unique_list_values(child_items, "vendors")
+        if context.get("chip_models") and ("ST" in context.get("vendors", [])) and context["chip_models"][0].startswith("STM32"):
+            context["product"] = f"ST {context['chip_models'][0]}"
+        elif context.get("chip_models"):
+            context["product"] = context["chip_models"][0]
+        elif context.get("product_codes"):
+            context["product"] = context["product_codes"][0]
+        context["text"] = compact_parent_context(context, child_items, max(parent_context_tokens, 1))
+        context["page"] = min(item.get("page", context.get("page", 0)) for item in child_items)
+        context["start_page"] = min(item.get("start_page", item.get("page", context["page"])) for item in child_items)
+        context["end_page"] = max(item.get("end_page", item.get("page", context["page"])) for item in child_items)
+        context["char_start"] = min(item.get("char_start", context.get("char_start", 0)) for item in child_items)
+        context["char_end"] = max(item.get("char_end", context.get("char_end", 0)) for item in child_items)
+
+    return contexts
 
 
 def expand_adjacent_chunks(results: list[dict], metadata_by_id: dict[str, dict], window: int) -> list[dict]:
@@ -345,6 +704,11 @@ def print_results(results: list[dict]) -> None:
         section = item.get("section") or item.get("title") or ""
         section_label = f" section={section}" if section else ""
         product_label = f" product={item['product']}" if item.get("product") else ""
+        codes_label = f" product_codes={','.join(item['product_codes'])}" if item.get("product_codes") else ""
+        text_codes_label = f" text_product_codes={','.join(item['text_product_codes'])}" if item.get("text_product_codes") else ""
+        source_codes_label = f" source_product_codes={','.join(item['source_product_codes'])}" if item.get("source_product_codes") else ""
+        chips_label = f" chip_models={','.join(item['chip_models'])}" if item.get("chip_models") else ""
+        vendors_label = f" vendors={','.join(item['vendors'])}" if item.get("vendors") else ""
         version_label = f" version={item['version']}" if item.get("version") else ""
         adjacent_label = " adjacent=true" if item.get("is_adjacent") else ""
         print(
@@ -352,7 +716,8 @@ def print_results(results: list[dict]) -> None:
             f"hybrid={item.get('hybrid_score', 0.0):.4f} "
             f"dense={item.get('dense_score', 0.0):.4f} "
             f"lexical={item.get('lexical_score', 0.0):.4f} "
-            f"source={item['source']} page={page_label}{section_label}{product_label}{version_label}{adjacent_label}"
+            f"source={item['source']} page={page_label}{section_label}{product_label}"
+            f"{codes_label}{text_codes_label}{source_codes_label}{chips_label}{vendors_label}{version_label}{adjacent_label}"
         )
         print(item["text"])
         print()
@@ -404,29 +769,33 @@ def select_ollama_model(base_url: str) -> str:
         print(f"Please enter a number from 1 to {len(models)}.")
 
 
-def main() -> None:
-    args = parse_args()
-    results = retrieve(args.question, args)
+def answer_question(question: str, args: argparse.Namespace, chat_model: str | None = None) -> None:
+    results = retrieve(question, args)
     print_results(results)
 
     if args.retrieval_only:
         return
 
+    if (detect_requested_vendors(question) or detect_requested_chip_models(question)) and asks_for_product_list(question):
+        print("Answer:\n")
+        print(answer_product_list_from_metadata(question, results))
+        return
+
     try:
         if args.llm_provider == "openai":
-            chat_model = args.chat_model or DEFAULT_OPENAI_CHAT_MODEL
-            print(f"Calling OpenAI for final answer with model `{chat_model}`...\n")
-            answer = answer_with_openai(args.question, results, chat_model)
+            resolved_chat_model = chat_model or args.chat_model or DEFAULT_OPENAI_CHAT_MODEL
+            print(f"Calling OpenAI for final answer with model `{resolved_chat_model}`...\n")
+            answer = answer_with_openai(question, results, resolved_chat_model)
         else:
-            chat_model = args.chat_model or select_ollama_model(args.ollama_base_url)
+            resolved_chat_model = chat_model or args.chat_model or select_ollama_model(args.ollama_base_url)
             print(
-                f"Calling Ollama for final answer with model `{chat_model}` "
+                f"Calling Ollama for final answer with model `{resolved_chat_model}` "
                 f"at `{args.ollama_base_url}` with think=`{args.think}`...\n"
             )
             answer = answer_with_ollama(
-                args.question,
+                question,
                 results,
-                chat_model,
+                resolved_chat_model,
                 args.think,
                 args.ollama_base_url,
                 args.ollama_timeout,
@@ -437,6 +806,46 @@ def main() -> None:
 
     print("Answer:\n")
     print(answer)
+
+
+def resolve_chat_model(args: argparse.Namespace) -> str | None:
+    if args.retrieval_only:
+        return None
+    if args.llm_provider == "openai":
+        return args.chat_model or DEFAULT_OPENAI_CHAT_MODEL
+    return args.chat_model or select_ollama_model(args.ollama_base_url)
+
+
+def interactive_loop(args: argparse.Namespace) -> None:
+    chat_model = resolve_chat_model(args)
+    print("Interactive RAG CLI. Type `exit`, `quit`, or `q` to stop.\n")
+
+    while True:
+        try:
+            question = input("Question> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            return
+
+        if not question:
+            continue
+        if question.lower() in {"exit", "quit", "q"}:
+            print("Bye.")
+            return
+
+        print()
+        answer_question(question, args, chat_model=chat_model)
+        print()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.interactive or not args.question:
+        interactive_loop(args)
+        return
+
+    answer_question(args.question, args)
 
 
 if __name__ == "__main__":

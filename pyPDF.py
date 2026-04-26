@@ -1,5 +1,6 @@
 import json
 import re
+from bisect import bisect_left
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -9,8 +10,10 @@ DOCS_DIR = Path.home() / "rag-project" / "docs"
 OUTPUT_DIR = Path.home() / "rag-project" / "data"
 RAW_OUTPUT = OUTPUT_DIR / "pdf_pages.jsonl"
 CHUNK_OUTPUT = OUTPUT_DIR / "pdf_chunks.jsonl"
-DEFAULT_CHUNK_SIZE = 800
-DEFAULT_CHUNK_OVERLAP = 120
+DEFAULT_CHUNK_SIZE = 320
+DEFAULT_CHUNK_OVERLAP = 50
+DEFAULT_PARENT_CHUNK_SIZE = 850
+DEFAULT_PARENT_CHUNK_OVERLAP = 100
 SPLIT_SEPARATORS = ["\n\n", "\n", "Q:", "A:", "Question:", "Answer:", ". ", "; ", ", ", " ", ""]
 HEADER_FOOTER_MIN_PAGES = 2
 
@@ -20,6 +23,17 @@ SECTION_PATTERNS = [
     re.compile(r"^\s*(?:chapter|section)\s+\d+[:.)]?\s+.{3,80}$", re.IGNORECASE),
     re.compile(r"^\s*(?:hardware|software|features|specifications|dimensions|block diagram|i/o|display|memory|cpu)\s*$", re.IGNORECASE),
 ]
+
+DOCUMENT_SECTION_PATTERNS = [
+    re.compile(r"^\s*(?:\d+(?:\.\d+)+[.)]?|\d+[.)])\s+.{3,80}$"),
+    re.compile(r"^\s*(?:chapter|section)\s+\d+[:.)]?\s+.{3,80}$", re.IGNORECASE),
+    re.compile(r"^\s*(?:hardware|software|features|specifications|dimensions|block diagram)\s*$", re.IGNORECASE),
+]
+
+TOKEN_PATTERN = re.compile(
+    r"[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)*|[\u4e00-\u9fff]|[^\s]",
+    re.UNICODE,
+)
 
 
 def normalize_text(text: str) -> str:
@@ -32,6 +46,44 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def format_table_as_rows(table: list[list[str | None]], table_index: int) -> str:
+    cleaned_rows = []
+    for row in table:
+        cells = [normalize_text(cell or "") for cell in row]
+        if any(cells):
+            cleaned_rows.append(cells)
+
+    if not cleaned_rows:
+        return ""
+
+    max_columns = max(len(row) for row in cleaned_rows)
+    normalized_rows = [row + [""] * (max_columns - len(row)) for row in cleaned_rows]
+    first_row = normalized_rows[0]
+    first_row_has_header_shape = (
+        len([cell for cell in first_row if cell]) >= 2
+        and sum(bool(re.search(r"[A-Za-z\u4e00-\u9fff]", cell)) for cell in first_row) >= 2
+    )
+
+    if first_row_has_header_shape:
+        headers = [
+            cell if cell else f"Column {idx}"
+            for idx, cell in enumerate(first_row, start=1)
+        ]
+        data_rows = normalized_rows[1:]
+    else:
+        headers = [f"Column {idx}" for idx in range(1, max_columns + 1)]
+        data_rows = normalized_rows
+
+    lines = [f"Table: Table {table_index}"]
+    for row_index, row in enumerate(data_rows, start=1):
+        lines.append(f"Row {row_index}:")
+        for header, cell in zip(headers, row):
+            if cell:
+                lines.append(f"{header}: {cell}")
+
+    return "\n".join(lines)
+
+
 def extract_table_texts_with_pdfplumber(pdf_path: Path) -> dict[int, list[str]]:
     try:
         import pdfplumber
@@ -42,14 +94,10 @@ def extract_table_texts_with_pdfplumber(pdf_path: Path) -> dict[int, list[str]]:
     with pdfplumber.open(pdf_path) as pdf:
         for page_index, page in enumerate(pdf.pages, start=1):
             page_tables = []
-            for table in page.extract_tables() or []:
-                rows = []
-                for row in table:
-                    cells = [(cell or "").strip() for cell in row]
-                    if any(cells):
-                        rows.append(" | ".join(cells))
-                if rows:
-                    page_tables.append("\n".join(rows))
+            for table_index, table in enumerate(page.extract_tables() or [], start=1):
+                table_text = format_table_as_rows(table, table_index)
+                if table_text:
+                    page_tables.append(table_text)
             if page_tables:
                 table_texts[page_index] = page_tables
     return table_texts
@@ -242,6 +290,107 @@ def split_long_span(text: str, start_offset: int, chunk_size: int, separators: l
     return recursive_split_spans(text, start_offset, chunk_size, separators)
 
 
+def token_spans(text: str) -> list[dict]:
+    return [
+        {"token": match.group(0), "start": match.start(), "end": match.end()}
+        for match in TOKEN_PATTERN.finditer(text)
+    ]
+
+
+def estimate_token_count(text: str) -> int:
+    return len(token_spans(text))
+
+
+def choose_token_split_end(
+    text: str,
+    tokens: list[dict],
+    token_starts: list[int],
+    start_index: int,
+    max_end_index: int,
+    min_tokens: int,
+    separators: list[str],
+) -> int:
+    if max_end_index >= len(tokens):
+        return len(tokens)
+
+    min_end_index = min(max(start_index + min_tokens, start_index + 1), max_end_index)
+    min_char = tokens[min_end_index - 1]["end"]
+    max_char = tokens[max_end_index - 1]["end"]
+
+    for separator in [item for item in separators if item]:
+        cursor = min_char
+        selected_split = -1
+        while True:
+            idx = text.find(separator, cursor, max_char + 1)
+            if idx < 0:
+                break
+            split_char = idx + len(separator)
+            if split_char <= max_char:
+                selected_split = split_char
+            cursor = idx + max(len(separator), 1)
+
+        if selected_split > 0:
+            end_index = bisect_left(token_starts, selected_split)
+            if end_index > start_index:
+                return end_index
+
+    return max_end_index
+
+
+def token_split_spans(
+    text: str,
+    start_offset: int = 0,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+    separators: list[str] | None = None,
+) -> list[dict]:
+    tokens = token_spans(text)
+    if not tokens:
+        return []
+    if len(tokens) <= chunk_size:
+        span = make_chunk_span(text, start_offset, start_offset + len(text), base_offset=start_offset)
+        return [span] if span else []
+
+    separators = separators or SPLIT_SEPARATORS
+    token_starts = [token["start"] for token in tokens]
+    min_tokens = max(20, int(chunk_size * 0.55))
+    spans = []
+    start_index = 0
+
+    while start_index < len(tokens):
+        max_end_index = min(start_index + chunk_size, len(tokens))
+        end_index = choose_token_split_end(
+            text,
+            tokens,
+            token_starts,
+            start_index,
+            max_end_index,
+            min_tokens,
+            separators,
+        )
+        if end_index <= start_index:
+            end_index = max_end_index
+
+        relative_start = tokens[start_index]["start"]
+        relative_end = tokens[end_index - 1]["end"]
+        span = make_chunk_span(
+            text,
+            start_offset + relative_start,
+            start_offset + relative_end,
+            base_offset=start_offset,
+        )
+        if span:
+            spans.append(span)
+
+        if end_index >= len(tokens):
+            break
+
+        next_start = max(end_index - overlap, start_index + 1)
+        start_index = next_start
+
+    return spans
+
+
 def align_to_text_boundary(text: str, start: int, limit: int = 40) -> int:
     if start <= 0 or start >= len(text):
         return max(0, min(start, len(text)))
@@ -275,16 +424,31 @@ def add_overlap_spans(text: str, spans: list[dict], overlap: int = DEFAULT_CHUNK
     return overlapped
 
 
-def chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[dict]:
-    spans = recursive_split_spans(text, chunk_size=chunk_size)
-    return add_overlap_spans(text, spans, overlap=overlap)
+def chunk_text(
+    text: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+    start_offset: int = 0,
+) -> list[dict]:
+    return token_split_spans(text, start_offset=start_offset, chunk_size=chunk_size, overlap=overlap)
 
 
 def is_section_heading(line: str) -> bool:
     line = line.strip()
     if not line or len(line) > 100:
         return False
+    if re.match(r"^\d+(?:\.\d+)?\s*(?:inch|inches|mm|cm|v|hz|khz|mhz|ghz|gb|mb)\b", line, re.IGNORECASE):
+        return False
     return any(pattern.match(line) for pattern in SECTION_PATTERNS)
+
+
+def is_document_section_heading(line: str) -> bool:
+    line = line.strip()
+    if not line or len(line) > 100:
+        return False
+    if re.match(r"^\d+(?:\.\d+)?\s*(?:inch|inches|mm|cm|v|hz|khz|mhz|ghz|gb|mb)\b", line, re.IGNORECASE):
+        return False
+    return any(pattern.match(line) for pattern in DOCUMENT_SECTION_PATTERNS)
 
 
 def extract_title_and_section(text: str) -> tuple[str, str]:
@@ -313,6 +477,91 @@ def extract_heading_level(text: str) -> int:
     if is_section_heading(first_nonempty):
         return 2
     return 0
+
+
+def iter_line_spans(text: str) -> list[dict]:
+    spans = []
+    cursor = 0
+    for line in text.splitlines(keepends=True):
+        start = cursor
+        end = cursor + len(line)
+        spans.append({"start": start, "end": end, "text": line.rstrip("\n")})
+        cursor = end
+    if cursor < len(text):
+        spans.append({"start": cursor, "end": len(text), "text": text[cursor:]})
+    return spans
+
+
+def split_document_sections(text: str) -> list[dict]:
+    line_spans = iter_line_spans(text)
+    if not line_spans:
+        return []
+
+    sections = []
+    current_start = 0
+    current_section = ""
+    current_heading_level = 0
+
+    for line in line_spans:
+        stripped = line["text"].strip()
+        if not is_document_section_heading(stripped):
+            continue
+
+        if line["start"] > current_start:
+            section_text = text[current_start:line["start"]]
+            if section_text.strip():
+                sections.append(
+                    {
+                        "start": current_start,
+                        "end": line["start"],
+                        "text": section_text,
+                        "section": current_section,
+                        "heading_level": current_heading_level,
+                    }
+                )
+
+        current_start = line["start"]
+        current_section = stripped[:120]
+        current_heading_level = extract_heading_level(stripped)
+
+    if current_start < len(text):
+        section_text = text[current_start:]
+        if section_text.strip():
+            sections.append(
+                {
+                    "start": current_start,
+                    "end": len(text),
+                    "text": section_text,
+                    "section": current_section,
+                    "heading_level": current_heading_level,
+                }
+            )
+
+    if not sections:
+        return [{"start": 0, "end": len(text), "text": text, "section": "", "heading_level": 0}]
+
+    merged_sections = []
+    idx = 0
+    while idx < len(sections):
+        section = sections[idx]
+        if section.get("section") and estimate_token_count(section["text"]) <= 8 and idx + 1 < len(sections):
+            next_section = sections[idx + 1].copy()
+            parent_section = section["section"]
+            child_section = next_section.get("section", "")
+            next_section["start"] = section["start"]
+            next_section["text"] = text[section["start"]:next_section["end"]]
+            next_section["section"] = (
+                f"{parent_section} / {child_section}" if child_section and child_section != parent_section else parent_section
+            )[:120]
+            next_section["heading_level"] = section.get("heading_level", next_section.get("heading_level", 0))
+            merged_sections.append(next_section)
+            idx += 2
+            continue
+
+        merged_sections.append(section)
+        idx += 1
+
+    return merged_sections
 
 
 def extract_list_structure(text: str) -> str:
@@ -350,20 +599,77 @@ def infer_doc_type(pdf_path: str | None) -> str:
     return "document"
 
 
+def unique_values(values: list[str]) -> list[str]:
+    seen = set()
+    unique = []
+    for value in values:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if not normalized:
+            continue
+        key = normalized.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(normalized)
+    return unique
+
+
+def extract_product_codes(text: str) -> list[str]:
+    return unique_values(
+        [match.upper() for match in re.findall(r"\bP\d{2}D\d{5}(?:-\d{2})?(?:-[A-Z0-9]+)?\b", text, flags=re.IGNORECASE)]
+    )
+
+
+def extract_product_identity(source: str, text: str) -> dict:
+    source_product_codes = extract_product_codes(source)
+    text_product_codes = extract_product_codes(text)
+    product_codes = text_product_codes or source_product_codes
+    chip_models = unique_values(
+        [
+            match.upper()
+            for match in re.findall(
+                r"\b(?:RK\d{4}[A-Z0-9]*|STM32[A-Z0-9]+|RTL\d+[A-Z0-9]*|RZ/[A-Z0-9]+)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ]
+    )
+
+    for match in re.findall(r"\bi\.MX[0-9A-Za-z]+(?:\s+\w+)?\b", text):
+        chip_models.append(match)
+    chip_models = unique_values(chip_models)
+
+    vendors = []
+    if re.search(r"\bST\b", text, flags=re.IGNORECASE) or any(model.startswith("STM32") for model in chip_models):
+        vendors.append("ST")
+    if re.search(r"\bRockchip\b", text, flags=re.IGNORECASE) or any(model.startswith("RK") for model in chip_models):
+        vendors.append("Rockchip")
+    if re.search(r"\bNXP\b", text, flags=re.IGNORECASE) or any(model.lower().startswith("i.mx") for model in chip_models):
+        vendors.append("NXP")
+    if any(model.startswith("RTL") for model in chip_models):
+        vendors.append("Realtek")
+    if any(model.startswith("RZ/") for model in chip_models):
+        vendors.append("Renesas")
+    vendors = unique_values(vendors)
+
+    primary_product = ""
+    if chip_models:
+        primary_product = f"ST {chip_models[0]}" if vendors[:1] == ["ST"] and chip_models[0].startswith("STM32") else chip_models[0]
+    elif product_codes:
+        primary_product = product_codes[0]
+
+    return {
+        "product": primary_product,
+        "product_codes": product_codes,
+        "text_product_codes": text_product_codes,
+        "source_product_codes": source_product_codes,
+        "chip_models": chip_models,
+        "vendors": vendors,
+    }
+
+
 def extract_product(source: str, text: str) -> str:
-    candidates = []
-    candidates.extend(re.findall(r"\bP\d{2}D\d{5}(?:-\d{2}(?:-[A-Z0-9]+)?)?\b", source.upper()))
-    candidates.extend(re.findall(r"\b(?:RK\d{4}|STM32[A-Z0-9]+|RTL\d+[A-Z0-9]*|RZ/[A-Z0-9]+)\b", text, flags=re.IGNORECASE))
-
-    imx_match = re.search(r"\bi\.MX[0-9A-Za-z]+(?:\s+\w+)?\b", text)
-    if imx_match:
-        candidates.append(imx_match.group(0))
-
-    for candidate in candidates:
-        normalized = re.sub(r"\s+", " ", candidate).strip()
-        if normalized:
-            return normalized
-    return ""
+    return extract_product_identity(source, text)["product"]
 
 
 def extract_version(text: str) -> str:
@@ -480,6 +786,54 @@ def find_pages_for_span(start: int, end: int, page_spans: list[dict]) -> tuple[i
     return matched_pages[0], matched_pages[-1]
 
 
+def build_parent_child_spans(
+    source: str,
+    document_text: str,
+    page_spans: list[dict],
+    child_chunk_size: int,
+    child_overlap: int,
+    parent_chunk_size: int = DEFAULT_PARENT_CHUNK_SIZE,
+    parent_overlap: int = DEFAULT_PARENT_CHUNK_OVERLAP,
+) -> list[dict]:
+    child_spans = []
+    parent_index = 0
+
+    for section in split_document_sections(document_text):
+        parents = chunk_text(
+            section["text"],
+            chunk_size=parent_chunk_size,
+            overlap=parent_overlap,
+            start_offset=section["start"],
+        )
+
+        for parent in parents:
+            parent_index += 1
+            parent_start_page, parent_end_page = find_pages_for_span(parent["start"], parent["end"], page_spans)
+            parent_id = f"{source}-p{parent_start_page}-{parent_end_page}-parent-{parent_index}"
+            children = chunk_text(
+                parent["text"],
+                chunk_size=child_chunk_size,
+                overlap=child_overlap,
+                start_offset=parent["start"],
+            )
+
+            for child_index, child in enumerate(children, start=1):
+                child["parent_id"] = parent_id
+                child["parent_index"] = parent_index
+                child["parent_child_index"] = child_index
+                child["parent_child_count"] = len(children)
+                child["parent_text"] = parent["text"]
+                child["parent_char_start"] = parent["start"]
+                child["parent_char_end"] = parent["end"]
+                child["parent_start_page"] = parent_start_page
+                child["parent_end_page"] = parent_end_page
+                child["parent_section"] = section.get("section", "")
+                child["parent_heading_level"] = section.get("heading_level", 0)
+                child_spans.append(child)
+
+    return child_spans
+
+
 def build_chunk_record(
     source: str,
     file_path: str,
@@ -489,10 +843,15 @@ def build_chunk_record(
     doc_type: str,
 ) -> dict:
     start_page, end_page = find_pages_for_span(chunk["start"], chunk["end"], page_spans)
-    title, section = extract_title_and_section(chunk["text"])
-    product = extract_product(source, chunk["text"])
-    version = extract_version(chunk["text"])
-    heading_level = extract_heading_level(chunk["text"])
+    context_text = chunk.get("parent_text", chunk["text"])
+    title, detected_section = extract_title_and_section(chunk["text"])
+    parent_title, parent_section = extract_title_and_section(context_text)
+    section = detected_section or chunk.get("parent_section", "") or parent_section
+    title = detected_section or section or title or parent_title
+    metadata_text = f"{chunk['text']}\n\n{context_text}"
+    product_identity = extract_product_identity(source, metadata_text)
+    version = extract_version(metadata_text)
+    heading_level = extract_heading_level(chunk["text"]) or chunk.get("parent_heading_level", 0)
     list_structure = extract_list_structure(chunk["text"])
     table_context = extract_table_context(chunk["text"])
 
@@ -506,10 +865,17 @@ def build_chunk_record(
         "char_start": chunk["start"],
         "char_end": chunk["end"],
         "chunk_index": idx,
+        "chunk_role": "child",
+        "token_count": estimate_token_count(chunk["text"]),
         "section": section,
         "title": title,
         "doc_type": doc_type,
-        "product": product,
+        "product": product_identity["product"],
+        "product_codes": product_identity["product_codes"],
+        "text_product_codes": product_identity["text_product_codes"],
+        "source_product_codes": product_identity["source_product_codes"],
+        "chip_models": product_identity["chip_models"],
+        "vendors": product_identity["vendors"],
         "version": version,
         "heading_level": heading_level,
         "list_structure": list_structure,
@@ -517,6 +883,16 @@ def build_chunk_record(
         "language": detect_language(chunk["text"]),
         "tags": extract_tags(chunk["text"]),
         "text": chunk["text"],
+        "parent_id": chunk.get("parent_id", f"{source}-p{start_page}-{end_page}-parent-{idx}"),
+        "parent_index": chunk.get("parent_index", idx),
+        "parent_child_index": chunk.get("parent_child_index", 1),
+        "parent_child_count": chunk.get("parent_child_count", 1),
+        "parent_text": context_text,
+        "parent_token_count": estimate_token_count(context_text),
+        "parent_start_page": chunk.get("parent_start_page", start_page),
+        "parent_end_page": chunk.get("parent_end_page", end_page),
+        "parent_char_start": chunk.get("parent_char_start", chunk["start"]),
+        "parent_char_end": chunk.get("parent_char_end", chunk["end"]),
     }
 
     if "question" in chunk:
@@ -526,7 +902,13 @@ def build_chunk_record(
     return record
 
 
-def build_chunks(pages: list[dict], chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[dict]:
+def build_chunks(
+    pages: list[dict],
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+    parent_chunk_size: int = DEFAULT_PARENT_CHUNK_SIZE,
+    parent_overlap: int = DEFAULT_PARENT_CHUNK_OVERLAP,
+) -> list[dict]:
     chunk_records = []
     pages_by_source: dict[str, list[dict]] = {}
 
@@ -539,8 +921,30 @@ def build_chunks(pages: list[dict], chunk_size: int = DEFAULT_CHUNK_SIZE, overla
         file_path = source_pages[0].get("file_path", "")
         doc_type = infer_doc_type(file_path)
         chunks = extract_faq_pairs(document_text) if doc_type == "faq" else []
-        if not chunks:
-            chunks = chunk_text(document_text, chunk_size=chunk_size, overlap=overlap)
+        if chunks:
+            for idx, chunk in enumerate(chunks, start=1):
+                start_page, end_page = find_pages_for_span(chunk["start"], chunk["end"], page_spans)
+                chunk["parent_id"] = f"{source}-p{start_page}-{end_page}-faq-parent-{idx}"
+                chunk["parent_index"] = idx
+                chunk["parent_child_index"] = 1
+                chunk["parent_child_count"] = 1
+                chunk["parent_text"] = chunk["text"]
+                chunk["parent_char_start"] = chunk["start"]
+                chunk["parent_char_end"] = chunk["end"]
+                chunk["parent_start_page"] = start_page
+                chunk["parent_end_page"] = end_page
+                chunk["parent_section"] = ""
+                chunk["parent_heading_level"] = 0
+        else:
+            chunks = build_parent_child_spans(
+                source,
+                document_text,
+                page_spans,
+                child_chunk_size=chunk_size,
+                child_overlap=overlap,
+                parent_chunk_size=parent_chunk_size,
+                parent_overlap=parent_overlap,
+            )
 
         for idx, chunk in enumerate(chunks, start=1):
             chunk_records.append(build_chunk_record(source, file_path, idx, chunk, page_spans, doc_type))

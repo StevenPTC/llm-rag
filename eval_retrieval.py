@@ -20,7 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dense-top-k", type=int, default=20, help="Number of dense retrieval candidates")
     parser.add_argument("--hybrid-top-k", type=int, default=20, help="Number of candidates kept after hybrid merge")
     parser.add_argument("--top-k", type=int, default=5, help="Final number of primary chunks after reranking")
+    parser.add_argument("--product-list-top-k", type=int, default=20, help="Unique product contexts for product-list queries")
     parser.add_argument("--adjacent-window", type=int, default=1, help="How many adjacent chunks to include per selected chunk")
+    parser.add_argument("--parent-context-tokens", type=int, default=700, help="Compact parent context token window")
     parser.add_argument("--embed-model", default="sentence-transformers/all-MiniLM-L6-v2", help="Embedding model name")
     parser.add_argument("--reranker-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2", help="Cross-encoder reranker model name")
     parser.add_argument("--output", default=None, help="Optional path to save detailed JSON report")
@@ -36,9 +38,11 @@ def build_query_args(eval_args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         backend=eval_args.backend,
         top_k=eval_args.top_k,
+        product_list_top_k=eval_args.product_list_top_k,
         dense_top_k=eval_args.dense_top_k,
         hybrid_top_k=eval_args.hybrid_top_k,
         adjacent_window=eval_args.adjacent_window,
+        parent_context_tokens=eval_args.parent_context_tokens,
         embed_model=eval_args.embed_model,
         reranker_model=eval_args.reranker_model,
         disable_hybrid=False,
@@ -56,7 +60,9 @@ def target_matches(result: dict, target: dict) -> bool:
     checks = []
 
     if target.get("chunk_id"):
-        checks.append(result.get("chunk_id") == target["chunk_id"])
+        result_chunk_ids = {result.get("chunk_id"), result.get("context_id")}
+        result_chunk_ids.update(result.get("matched_child_ids", []))
+        checks.append(target["chunk_id"] in result_chunk_ids)
     if target.get("source"):
         checks.append(result.get("source") == target["source"])
     if target.get("page") is not None:
@@ -67,6 +73,16 @@ def target_matches(result: dict, target: dict) -> bool:
         checks.append(result.get("start_page", result.get("page")) <= target["end_page"])
     if target.get("product"):
         checks.append(result.get("product") == target["product"])
+    if target.get("product_codes"):
+        checks.append(set(target["product_codes"]).issubset(set(result.get("product_codes", []))))
+    if target.get("text_product_codes"):
+        checks.append(set(target["text_product_codes"]).issubset(set(result.get("text_product_codes", []))))
+    if target.get("source_product_codes"):
+        checks.append(set(target["source_product_codes"]).issubset(set(result.get("source_product_codes", []))))
+    if target.get("chip_models"):
+        checks.append(set(target["chip_models"]).issubset(set(result.get("chip_models", []))))
+    if target.get("vendors"):
+        checks.append(set(target["vendors"]).issubset(set(result.get("vendors", []))))
     if target.get("version"):
         checks.append(result.get("version") == target["version"])
     if target.get("section"):

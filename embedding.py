@@ -5,6 +5,7 @@ from rag_utils import (
     DEFAULT_EMBED_MODEL,
     EMBEDDINGS_PATH,
     METADATA_PATH,
+    build_embedding_text,
     embed_texts,
     load_embedding_inputs,
     save_embeddings,
@@ -24,7 +25,7 @@ def main() -> None:
     args = parse_args()
     input_path = Path(args.input) if args.input else None
     records = load_embedding_inputs(path=input_path) if input_path else load_embedding_inputs()
-    texts = [record["text"] for record in records]
+    texts = [build_embedding_text(record) for record in records]
     embeddings = embed_texts(texts, model_name=args.model, batch_size=args.batch_size)
 
     save_embeddings(embeddings, EMBEDDINGS_PATH)

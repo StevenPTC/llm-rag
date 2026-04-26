@@ -50,9 +50,12 @@ rag-project/
 - 清理多餘空白、頁碼、重複頁首頁尾與常見浮水印文字
 - 修正 PDF 斷字，例如 `auto-\nmatically`
 - 先合併同一份 PDF，再做可跨頁的語意切塊
-- 依 `chunk_size=800`、`overlap=120` 進行 span-based overlap
+- 以 token estimate 切 child chunk，預設 `chunk_size=320`、`overlap=50`
+- 同時產生 parent chunk，預設 `parent_chunk_size=850`、`parent_overlap=100`
+- 先在文件層偵測高層章節，再讓 child chunk 繼承 `section`
+- 表格會轉成 row-level 文字，例如 `Row 1:`、`Voltage: 12V`
 - 記錄 `char_start` / `char_end`，讓 chunk 可回查原文位置
-- 偵測 `section` / `title` / `doc_type` / `product` / `version` / `tags`
+- 偵測 `section` / `title` / `doc_type` / `product` / `product_codes` / `text_product_codes` / `source_product_codes` / `chip_models` / `vendors` / `version` / `tags` / `parent_id`
 - FAQ 文件若包含 `Q:` / `A:` 或 `Question:` / `Answer:`，會優先以 QA pair 作為 chunk
 
 輸出：
@@ -64,6 +67,7 @@ rag-project/
 負責：
 - 讀取 `data/pdf_chunks.jsonl`
 - 使用 `sentence-transformers` 產生每個 chunk 的向量
+- embedding input 會包含 `title` / `section` / `product` / `product_codes` / `text_product_codes` / `source_product_codes` / `chip_models` / `vendors` / `version` / `tags` / `doc_type` / `table_context` 與 child `text`
 
 輸出：
 - `data/embeddings.npy`
@@ -90,8 +94,9 @@ rag-project/
 
 負責：
 - 對問題做 embedding
-- 從向量索引中找出最相關的 chunks
-- 將檢索結果交給 LLM 生成答案
+- 從向量索引中找出最相關的 child chunks
+- 用 `prev_chunk_id` / `next_chunk_id` 補相鄰 child chunks 後再 rerank
+- 將命中的 child chunks 合併成 compact parent contexts，再交給 LLM 生成答案
 
 預設：
 - 檢索 backend: `faiss`
@@ -102,7 +107,7 @@ rag-project/
 
 負責：
 - 讀取標註好的離線評估集
-- 比較 `dense` / `hybrid` / `rerank` / `final(with adjacent chunks)` 各階段表現
+- 比較 `dense` / `hybrid` / `rerank` / `final(compact parent context)` 各階段表現
 - 計算 `Hit@K`、`MRR`、`mean first relevant rank`
 - 輸出 rerank 相對於 dense baseline 的改善幅度
 
@@ -221,12 +226,28 @@ source .venv/bin/activate
 .venv/bin/python query.py "這份文件的 CPU 是什麼？"
 ```
 
+如果想連續測試多個問題，可以進入互動式 CLI：
+
+```bash
+.venv/bin/python query.py --interactive
+```
+
+或直接不帶問題，也會進入互動模式：
+
+```bash
+.venv/bin/python query.py
+```
+
+在互動模式中輸入 `exit`、`quit` 或 `q` 可結束。
+
 這會：
 - 先做 dense retrieval（預設 top 20）
 - 再做 lexical hybrid merge
-- 再做 reranker 排序
-- 取 top 5 主 chunk，並自動補入相鄰 chunk
+- 若問題是在列出特定 vendor/product，會補入符合 `vendors` metadata 的候選並加權
+- 再用 metadata-aware 文字做 reranker 排序
+- 取 top 5 child hits 後，才用 `prev_chunk_id` / `next_chunk_id` 補相鄰 child chunks，去重並轉成 compact parent contexts
 - 印出 retrieved contexts
+- 產品清單型問題會直接由 metadata 產生 deterministic answer，不讓 LLM 自由生成
 - 列出本機 Ollama 模型讓你選擇
 - 再把 context 交給選到的模型回答
 
@@ -254,11 +275,24 @@ source .venv/bin/activate
 .venv/bin/python query.py "Which product uses RK3568?" --dense-top-k 20 --top-k 5 --adjacent-window 1
 ```
 
+如果想控制最後交給 LLM 的 parent window 大小：
+
+```bash
+.venv/bin/python query.py "Which product uses RK3568?" --parent-context-tokens 700
+```
+
+產品清單型問題會按產品去重後多收幾個 context，預設最多 20 個，且直接根據 metadata 產生答案：
+
+```bash
+.venv/bin/python query.py "請幫我尋找ST的產品有哪些，幫我條列出來" --product-list-top-k 20
+```
+
 如果想暫時關閉 hybrid 或 reranker 做比較：
 
 ```bash
 .venv/bin/python query.py "Which product uses RK3568?" --disable-hybrid --retrieval-only
 .venv/bin/python query.py "Which product uses RK3568?" --disable-rerank --retrieval-only
+.venv/bin/python query.py "Which product uses RK3568?" --disable-hybrid --disable-rerank --retrieval-only
 ```
 
 ### 5. 離線檢索評估
@@ -282,6 +316,11 @@ eval/retrieval_eval.sample.jsonl
 - `start_page`
 - `end_page`
 - `product`
+- `product_codes`
+- `text_product_codes`
+- `source_product_codes`
+- `chip_models`
+- `vendors`
 - `version`
 - `section`
 - `tags`
@@ -303,13 +342,15 @@ eval/retrieval_eval.sample.jsonl
 - `dense`
 - `hybrid`
 - `rerank`
-- `final`
+- `final`，也就是補相鄰 chunk 並轉成 compact parent context 之後的結果
 
 並顯示：
 - `Hit@1 / Hit@3 / Hit@5`
 - `MRR`
 - `mean first relevant rank`
 - `rerank` 與 `final` 相對 `dense` 的改善幅度
+
+建議先用 20 到 50 題建立最小評估集，讓每題至少標一個 `targets` 條件。若 `dense` 沒 hit，優先看 chunk / embedding；若 `dense` hit 但 `rerank` 掉了，檢查 reranker；若 `rerank` hit 但 `final` 或 LLM 回答不對，通常是 parent context 或 prompt/生成問題。
 
 如果想切到 Chroma：
 
@@ -383,14 +424,15 @@ export OPENAI_API_KEY=your_api_key
 每行一筆 chunk 級資料，例如：
 
 ```json
-{"chunk_id":"P05D00107-00.pdf-p1-1-c1","source":"P05D00107-00.pdf","file_path":"/home/steven/rag-project/docs/P05D00107-00.pdf","page":1,"start_page":1,"end_page":1,"char_start":0,"char_end":696,"chunk_index":1,"section":"Hardware","title":"Hardware","doc_type":"datasheet","product":"P05D00107-00","version":"Yocto 4.0","language":"en","tags":["hardware","software","ethernet"],"text":"..."}
+{"chunk_id":"P05D00107-00.pdf-p1-1-c1","source":"P05D00107-00.pdf","page":1,"start_page":1,"end_page":1,"char_start":0,"char_end":696,"chunk_index":1,"chunk_role":"child","token_count":320,"section":"Hardware","parent_id":"P05D00107-00.pdf-p1-2-parent-1","parent_token_count":980,"parent_start_page":1,"parent_end_page":2,"text":"...","parent_text":"..."}
 ```
 
 用途：
-- 直接作為 embedding 的輸入
+- `text` 是 child chunk；embedding 會把 `title` / `section` / `product` / `product_codes` / `text_product_codes` / `source_product_codes` / `chip_models` / `vendors` / `version` / `tags` / `doc_type` / `table_context` 一起組進輸入
+- `parent_text` 是 compact parent context 的來源，不會整段無條件塞進 LLM
 - 是 RAG 最核心的中間資料
 - 透過 `start_page` / `end_page` / `char_start` / `char_end` 回查來源位置
-- 透過 `product` / `version` / `tags` 支援後續 filter 或 hybrid search
+- 透過 `product` / `product_codes` / `text_product_codes` / `source_product_codes` / `chip_models` / `vendors` / `version` / `tags` 支援後續 filter 或 hybrid search
 
 ### `data/embeddings.npy`
 
