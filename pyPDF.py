@@ -5,6 +5,8 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
+from specs import extract_specs_from_text
+
 
 DOCS_DIR = Path.home() / "rag-project" / "docs"
 OUTPUT_DIR = Path.home() / "rag-project" / "data"
@@ -850,6 +852,7 @@ def build_chunk_record(
     title = detected_section or section or title or parent_title
     metadata_text = f"{chunk['text']}\n\n{context_text}"
     product_identity = extract_product_identity(source, metadata_text)
+    specs_payload = extract_specs_from_text(metadata_text)
     version = extract_version(metadata_text)
     heading_level = extract_heading_level(chunk["text"]) or chunk.get("parent_heading_level", 0)
     list_structure = extract_list_structure(chunk["text"])
@@ -882,6 +885,8 @@ def build_chunk_record(
         "table_context": table_context,
         "language": detect_language(chunk["text"]),
         "tags": extract_tags(chunk["text"]),
+        "specs": specs_payload["specs"],
+        "spec_evidence": specs_payload["spec_evidence"],
         "text": chunk["text"],
         "parent_id": chunk.get("parent_id", f"{source}-p{start_page}-{end_page}-parent-{idx}"),
         "parent_index": chunk.get("parent_index", idx),

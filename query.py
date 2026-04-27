@@ -1,7 +1,10 @@
 import argparse
+import json
 import math
 import re
 from collections import Counter
+from datetime import datetime
+from pathlib import Path
 
 from rag_utils import (
     CHROMA_DIR,
@@ -15,12 +18,21 @@ from rag_utils import (
     build_embedding_text,
     build_prompt,
     build_rerank_text,
+    build_structured_prompt,
     call_ollama_chat,
     embed_texts,
     ensure_openai_client,
     get_cross_encoder,
     list_ollama_models,
     load_jsonl,
+)
+from specs import (
+    build_product_specs,
+    format_product_spec_line,
+    format_structured_context,
+    plan_specs_query,
+    product_matches_plan,
+    sort_products_by_retrieval,
 )
 
 
@@ -86,6 +98,32 @@ def parse_args() -> argparse.Namespace:
         "--retrieval-only",
         action="store_true",
         help="Only print retrieved contexts, do not call the chat model",
+    )
+    parser.add_argument(
+        "--debug-retrieval",
+        action="store_true",
+        help="Write a retrieval debug JSON file for this query",
+    )
+    parser.add_argument(
+        "--debug-dir",
+        default=str(METADATA_PATH.parent / "debug"),
+        help="Directory for retrieval debug files",
+    )
+    parser.add_argument(
+        "--no-print-results",
+        action="store_true",
+        help="Do not print retrieved contexts to stdout",
+    )
+    parser.add_argument(
+        "--disable-structured-filter",
+        action="store_true",
+        help="Disable specs metadata query planning and structured filtering",
+    )
+    parser.add_argument(
+        "--structured-product-limit",
+        type=int,
+        default=20,
+        help="Maximum number of filtered products passed to the LLM for structured spec queries",
     )
     return parser.parse_args()
 
@@ -372,62 +410,6 @@ def select_final_primary_results(question: str, reranked_results: list[dict], ar
             break
 
     return selected or reranked_results[: args.top_k]
-
-
-def answer_product_list_from_metadata(question: str, results: list[dict]) -> str:
-    requested_vendors = set(detect_requested_vendors(question))
-    requested_chips = set(detect_requested_chip_models(question))
-    source_text_codes = {}
-    for item in results:
-        text_codes = item.get("text_product_codes", [])
-        if text_codes:
-            source_text_codes.setdefault(item.get("source", ""), set()).update(text_codes)
-
-    rows_by_key = {}
-    row_order = []
-
-    for item in results:
-        vendors = item.get("vendors", [])
-        chips = item.get("chip_models", [])
-        if requested_vendors and not requested_vendors.intersection(vendors):
-            continue
-        if requested_chips and not requested_chips.intersection(chips):
-            continue
-
-        source = item.get("source", "")
-        text_codes = item.get("text_product_codes", [])
-        if source_text_codes.get(source) and not text_codes and item.get("source_product_codes"):
-            continue
-
-        codes = text_codes or item.get("product_codes", [])
-        code = codes[0] if codes else item.get("source", "").removesuffix(".pdf")
-        chip = chips[0] if chips else item.get("product", "")
-        if not code and not chip:
-            continue
-
-        key = code.upper() if code else chip.upper()
-        existing = rows_by_key.get(key)
-        if existing and (existing["chip"] or not chip):
-            continue
-        if key not in rows_by_key:
-            row_order.append(key)
-        rows_by_key[key] = {"code": code, "chip": chip, "source": source, "page": item.get("page", "")}
-
-    vendor_label = " / ".join(sorted(requested_vendors)) if requested_vendors else "指定"
-    if not rows_by_key:
-        return f"Answer: 目前提供的 context 中沒有找到明確的 {vendor_label} 相關產品。"
-
-    lines = [f"Answer: 目前找到的 {vendor_label} 相關產品如下："]
-    for idx, key in enumerate(row_order, start=1):
-        row = rows_by_key[key]
-        code = row["code"]
-        chip = row["chip"]
-        source = row["source"]
-        page = row["page"]
-        product_label = f"{code} — {chip}" if chip and chip != code else code or chip
-        page_label = f" 第 {page} 頁" if page != "" else ""
-        lines.append(f"{idx}. {product_label}，來源：{source}{page_label}")
-    return "\n".join(lines)
 
 
 def token_spans(text: str) -> list[dict]:
@@ -723,9 +705,167 @@ def print_results(results: list[dict]) -> None:
         print()
 
 
+DEBUG_RESULT_KEYS = [
+    "chunk_id",
+    "context_id",
+    "parent_id",
+    "prev_chunk_id",
+    "next_chunk_id",
+    "matched_child_ids",
+    "retrieval_role",
+    "is_adjacent",
+    "adjacent_to",
+    "dense_rank",
+    "dense_score",
+    "lexical_rank",
+    "lexical_score",
+    "hybrid_rank",
+    "hybrid_score",
+    "rerank_rank",
+    "rerank_score",
+    "metadata_vendor_match",
+    "source",
+    "page",
+    "start_page",
+    "end_page",
+    "char_start",
+    "char_end",
+    "section",
+    "title",
+    "heading_level",
+    "product",
+    "product_codes",
+    "text_product_codes",
+    "source_product_codes",
+    "chip_models",
+    "vendors",
+    "version",
+    "doc_type",
+    "tags",
+    "table_context",
+    "list_structure",
+    "specs",
+    "matched_child_texts",
+    "child_text",
+    "text",
+]
+
+
+def json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def debug_result_record(item: dict) -> dict:
+    return {
+        key: json_safe(item[key])
+        for key in DEBUG_RESULT_KEYS
+        if key in item and item[key] not in (None, [], {})
+    }
+
+
+def debug_args_record(args: argparse.Namespace) -> dict:
+    return {
+        key: json_safe(value)
+        for key, value in vars(args).items()
+        if key not in {"question"}
+    }
+
+
+def write_retrieval_debug_file(
+    question: str,
+    args: argparse.Namespace,
+    stages: dict[str, list[dict]],
+    structured_plan: dict,
+    filtered_products: list[dict] | None,
+) -> Path:
+    debug_dir = Path(args.debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = debug_dir / f"retrieval_{timestamp}.json"
+
+    payload = {
+        "schema_version": 1,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "question": question,
+        "args": debug_args_record(args),
+        "stages": {
+            stage_name: [debug_result_record(item) for item in results]
+            for stage_name, results in stages.items()
+        },
+        "structured_filter": {
+            "plan": json_safe(structured_plan),
+            "filtered_products": json_safe(filtered_products or []),
+        },
+    }
+
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+    latest_path = debug_dir / "retrieval_latest.json"
+    with latest_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+    return path
+
+
+def build_structured_filtered_products(
+    question: str,
+    plan: dict,
+    stages: dict[str, list[dict]],
+    limit: int,
+) -> tuple[list[dict], str]:
+    records, _ = load_metadata()
+    products = build_product_specs(records)
+    matching_products = [product for product in products if product_matches_plan(product, plan)]
+    retrieval_order = stages.get("rerank", []) + stages.get("hybrid", []) + stages.get("dense", [])
+    matching_products = sort_products_by_retrieval(matching_products, retrieval_order)
+    matching_products = matching_products[: max(limit, 1)]
+    structured_context = format_structured_context(plan, matching_products, max_products=limit)
+    return matching_products, structured_context
+
+
+def print_structured_results(plan: dict, products: list[dict]) -> None:
+    print("\nStructured specs filter:\n")
+    for condition in plan.get("conditions", []):
+        print(f"- {condition['field']} {condition['op']} {condition['value']}")
+
+    if not products:
+        print("\nNo product passed all structured conditions.\n")
+        return
+
+    fields = []
+    for condition in plan.get("conditions", []):
+        field = condition["field"]
+        if field != "vendor" and field not in fields:
+            fields.append(field)
+    if "cpu_soc" not in fields:
+        fields.insert(0, "cpu_soc")
+
+    print("\nFiltered products:\n")
+    for idx, product in enumerate(products, start=1):
+        print(f"[{idx}] {format_product_spec_line(product, fields)}")
+    print()
+
+
 def answer_with_openai(question: str, results: list[dict], chat_model: str) -> str:
     client = ensure_openai_client()
     response = client.responses.create(model=chat_model, input=build_prompt(question, results))
+    return response.output_text
+
+
+def answer_prompt_with_openai(prompt: str, chat_model: str) -> str:
+    client = ensure_openai_client()
+    response = client.responses.create(model=chat_model, input=prompt)
     return response.output_text
 
 
@@ -739,6 +879,22 @@ def answer_with_ollama(
 ) -> str:
     return call_ollama_chat(
         prompt=build_prompt(question, results),
+        model=chat_model,
+        think=False if think == "false" else (True if think == "true" else think),
+        base_url=ollama_base_url,
+        timeout=ollama_timeout,
+    )
+
+
+def answer_prompt_with_ollama(
+    prompt: str,
+    chat_model: str,
+    think: str,
+    ollama_base_url: str,
+    ollama_timeout: int,
+) -> str:
+    return call_ollama_chat(
+        prompt=prompt,
         model=chat_model,
         think=False if think == "false" else (True if think == "true" else think),
         base_url=ollama_base_url,
@@ -770,36 +926,69 @@ def select_ollama_model(base_url: str) -> str:
 
 
 def answer_question(question: str, args: argparse.Namespace, chat_model: str | None = None) -> None:
-    results = retrieve(question, args)
-    print_results(results)
+    stages = retrieve_stages(question, args)
+    results = stages["final"]
+    if not args.no_print_results:
+        print_results(results)
+
+    structured_plan = (
+        {"is_structured": False, "conditions": []}
+        if args.disable_structured_filter
+        else plan_specs_query(question)
+    )
+    structured_context = ""
+    filtered_products = []
+    if structured_plan.get("is_structured"):
+        filtered_products, structured_context = build_structured_filtered_products(
+            question,
+            structured_plan,
+            stages,
+            args.structured_product_limit,
+        )
+        if not args.no_print_results:
+            print_structured_results(structured_plan, filtered_products)
+
+    if args.debug_retrieval:
+        debug_path = write_retrieval_debug_file(question, args, stages, structured_plan, filtered_products)
+        print(f"Retrieval debug written to: {debug_path}")
 
     if args.retrieval_only:
-        return
-
-    if (detect_requested_vendors(question) or detect_requested_chip_models(question)) and asks_for_product_list(question):
-        print("Answer:\n")
-        print(answer_product_list_from_metadata(question, results))
         return
 
     try:
         if args.llm_provider == "openai":
             resolved_chat_model = chat_model or args.chat_model or DEFAULT_OPENAI_CHAT_MODEL
             print(f"Calling OpenAI for final answer with model `{resolved_chat_model}`...\n")
-            answer = answer_with_openai(question, results, resolved_chat_model)
+            if structured_plan.get("is_structured"):
+                answer = answer_prompt_with_openai(
+                    build_structured_prompt(question, structured_context),
+                    resolved_chat_model,
+                )
+            else:
+                answer = answer_with_openai(question, results, resolved_chat_model)
         else:
             resolved_chat_model = chat_model or args.chat_model or select_ollama_model(args.ollama_base_url)
             print(
                 f"Calling Ollama for final answer with model `{resolved_chat_model}` "
                 f"at `{args.ollama_base_url}` with think=`{args.think}`...\n"
             )
-            answer = answer_with_ollama(
-                question,
-                results,
-                resolved_chat_model,
-                args.think,
-                args.ollama_base_url,
-                args.ollama_timeout,
-            )
+            if structured_plan.get("is_structured"):
+                answer = answer_prompt_with_ollama(
+                    build_structured_prompt(question, structured_context),
+                    resolved_chat_model,
+                    args.think,
+                    args.ollama_base_url,
+                    args.ollama_timeout,
+                )
+            else:
+                answer = answer_with_ollama(
+                    question,
+                    results,
+                    resolved_chat_model,
+                    args.think,
+                    args.ollama_base_url,
+                    args.ollama_timeout,
+                )
     except (ConnectionError, EnvironmentError, ImportError, RuntimeError, TimeoutError) as exc:
         print(f"LLM answer skipped: {exc}")
         return

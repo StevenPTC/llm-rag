@@ -7,8 +7,9 @@
 - 中間產物放在 `data/`
 - 向量檢索預設使用 `FAISS`
 - 最終回答預設使用本機 `Ollama`，並在查詢時選擇本機已安裝模型
-- PDF 前處理會保留頁碼、章節、char range、產品、版本、heading level、list/table context 與 tags 等 metadata
-- 查詢流程支援 `Dense Retrieval -> Hybrid Search -> Reranker -> Top K -> Adjacent Chunks -> LLM`
+- PDF 前處理會保留頁碼、章節、char range、產品、版本、heading level、list/table context、tags 與 specs metadata
+- 查詢流程支援 `Dense Retrieval -> Hybrid Search -> Reranker -> Structured Specs Filter -> LLM`
+- 對產品規格、型號推薦、條件查詢，本專案採用 `RAG + 規格資料庫`：PDF chunk 用來找上下文，specs metadata 用來做精準判斷，LLM 用來產生自然語言答案
 
 ## 這個專案在做什麼
 
@@ -33,6 +34,7 @@ rag-project/
 ├─ embedding.py           # 將 chunks 轉成 embeddings
 ├─ index.py               # 建立向量索引（FAISS / Chroma）
 ├─ query.py               # 查詢 RAG
+├─ specs.py               # 規格 metadata 抽取、query planner、structured filter
 ├─ eval_retrieval.py      # 離線檢索評估
 ├─ eval/                  # 評估資料集範例
 ├─ rag_utils.py           # 共用工具函式
@@ -56,6 +58,7 @@ rag-project/
 - 表格會轉成 row-level 文字，例如 `Row 1:`、`Voltage: 12V`
 - 記錄 `char_start` / `char_end`，讓 chunk 可回查原文位置
 - 偵測 `section` / `title` / `doc_type` / `product` / `product_codes` / `text_product_codes` / `source_product_codes` / `chip_models` / `vendors` / `version` / `tags` / `parent_id`
+- 從 chunk/table/parent context 抽出 specs metadata，例如 `cpu_soc`、`uart_count`、`i2c_count`、`spi_count`、`can_count`、`usb_count`、`ethernet_count`、`ram_gb`、`flash_gb`、`has_lvds`、`has_mipi_dsi`、`has_mipi_csi`、`os_list`、`power_input`
 - FAQ 文件若包含 `Q:` / `A:` 或 `Question:` / `Answer:`，會優先以 QA pair 作為 chunk
 
 輸出：
@@ -96,7 +99,10 @@ rag-project/
 - 對問題做 embedding
 - 從向量索引中找出最相關的 child chunks
 - 用 `prev_chunk_id` / `next_chunk_id` 補相鄰 child chunks 後再 rerank
-- 將命中的 child chunks 合併成 compact parent contexts，再交給 LLM 生成答案
+- 將命中的 child chunks 合併成 compact parent contexts
+- 若問題包含規格條件，query planner 會先把自然語言轉成條件，例如 `UART >= 3`、`has_lvds = true`、`ram_gb >= 2`、`os_list contains Yocto`
+- structured filter 會用程式逐一比較產品級 specs metadata，只保留明確符合條件的產品
+- LLM 只接收符合條件的產品摘要與規格證據，負責中文整理、條列、推薦語氣與補充說明，不負責判斷誰符合條件
 
 預設：
 - 檢索 backend: `faiss`
@@ -246,8 +252,9 @@ source .venv/bin/activate
 - 若問題是在列出特定 vendor/product，會補入符合 `vendors` metadata 的候選並加權
 - 再用 metadata-aware 文字做 reranker 排序
 - 取 top 5 child hits 後，才用 `prev_chunk_id` / `next_chunk_id` 補相鄰 child chunks，去重並轉成 compact parent contexts
+- 如果 query planner 偵測到規格條件，會把所有 metadata 彙整成產品級 specs database，再用程式做 structured filter
 - 印出 retrieved contexts
-- 產品清單型問題會直接由 metadata 產生 deterministic answer，不讓 LLM 自由生成
+- 規格條件型問題只會把符合條件的產品摘要與證據交給 LLM，不會把一堆 raw chunks 全塞進 prompt
 - 列出本機 Ollama 模型讓你選擇
 - 再把 context 交給選到的模型回答
 
@@ -269,6 +276,31 @@ source .venv/bin/activate
 .venv/bin/python query.py "這份文件的 CPU 是什麼？" --retrieval-only
 ```
 
+如果想把某一題的 retrieval 過程留成 debug 檔：
+
+```bash
+.venv/bin/python query.py "Which product uses RK3568?" --retrieval-only --debug-retrieval
+```
+
+輸出會寫到 `data/debug/retrieval_*.json`，並同步更新 `data/debug/retrieval_latest.json`。如果只想留檔、不想讓 terminal 印出 retrieved contexts：
+
+```bash
+.venv/bin/python query.py "Which product uses RK3568?" --retrieval-only --debug-retrieval --no-print-results
+```
+
+如果想檢查 chunk 切分本身：
+
+```bash
+.venv/bin/python inspect_chunks.py
+```
+
+預設輸出 `data/debug/chunk_inspection.md`。也可以只看單一 PDF 或輸出 JSONL：
+
+```bash
+.venv/bin/python inspect_chunks.py --source HRBS10007ZHC21DB01.pdf
+.venv/bin/python inspect_chunks.py --format jsonl --output data/debug/chunk_inspection.jsonl
+```
+
 如果想手動調整檢索策略：
 
 ```bash
@@ -281,10 +313,23 @@ source .venv/bin/activate
 .venv/bin/python query.py "Which product uses RK3568?" --parent-context-tokens 700
 ```
 
-產品清單型問題會按產品去重後多收幾個 context，預設最多 20 個，且直接根據 metadata 產生答案：
+產品清單型問題會按產品去重後多收幾個 context，預設最多 20 個：
 
 ```bash
 .venv/bin/python query.py "請幫我尋找ST的產品有哪些，幫我條列出來" --product-list-top-k 20
+```
+
+規格條件型問題會先做 structured filter，再交給 LLM 格式化：
+
+```bash
+.venv/bin/python query.py "請找出 3 個 UART 以上且支援 Yocto 的產品"
+.venv/bin/python query.py "有哪些產品支援 LVDS 且 RAM 2GB 以上？"
+```
+
+如果要暫時關閉 specs planner/filter：
+
+```bash
+.venv/bin/python query.py "請找出 3 個 UART 以上的產品" --disable-structured-filter
 ```
 
 如果想暫時關閉 hybrid 或 reranker 做比較：
@@ -428,11 +473,12 @@ export OPENAI_API_KEY=your_api_key
 ```
 
 用途：
-- `text` 是 child chunk；embedding 會把 `title` / `section` / `product` / `product_codes` / `text_product_codes` / `source_product_codes` / `chip_models` / `vendors` / `version` / `tags` / `doc_type` / `table_context` 一起組進輸入
+- `text` 是 child chunk；embedding 會把 `title` / `section` / `product` / `product_codes` / `text_product_codes` / `source_product_codes` / `chip_models` / `vendors` / `version` / `tags` / `specs` / `doc_type` / `table_context` 一起組進輸入
 - `parent_text` 是 compact parent context 的來源，不會整段無條件塞進 LLM
 - 是 RAG 最核心的中間資料
 - 透過 `start_page` / `end_page` / `char_start` / `char_end` 回查來源位置
 - 透過 `product` / `product_codes` / `text_product_codes` / `source_product_codes` / `chip_models` / `vendors` / `version` / `tags` 支援後續 filter 或 hybrid search
+- 透過 `specs` / `spec_evidence` 支援 CPU/SoC、RAM、Flash/eMMC、UART、I2C、SPI、CAN、Ethernet、USB、LVDS、MIPI DSI、MIPI CSI、OS、Power Input 等常見 FAE 條件查詢
 
 ### `data/embeddings.npy`
 

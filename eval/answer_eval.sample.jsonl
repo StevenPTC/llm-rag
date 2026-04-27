@@ -1,0 +1,1 @@
+{"question":"Which document mentions Yocto Linux?","answer":"HIA128800T006-ZFC.pdf mentions Yocto Linux in the software section.","contexts":["Software section text mentioning Yocto Linux from HIA128800T006-ZFC.pdf."],"ground_truth":"HIA128800T006-ZFC.pdf mentions Yocto Linux."}

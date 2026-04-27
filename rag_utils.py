@@ -28,6 +28,18 @@ def _metadata_value(value: object) -> str:
         return ""
     if isinstance(value, list):
         return ", ".join(str(item).strip() for item in value if str(item).strip())
+    if isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            if item is None or item == []:
+                continue
+            if isinstance(item, list):
+                item_text = ", ".join(str(entry).strip() for entry in item if str(entry).strip())
+            else:
+                item_text = str(item).strip()
+            if item_text:
+                parts.append(f"{key}={item_text}")
+        return "; ".join(parts)
     return str(value).strip()
 
 
@@ -44,6 +56,7 @@ def build_metadata_aware_text(record: dict, content_key: str = "text") -> str:
         ("Version", record.get("version")),
         ("Document type", record.get("doc_type")),
         ("Tags", record.get("tags")),
+        ("Specs", record.get("specs")),
         ("Table context", record.get("table_context")),
         ("List structure", record.get("list_structure")),
     ]
@@ -242,6 +255,8 @@ def format_contexts(results: list[dict]) -> str:
             metadata_lines.append(f"vendors: {_metadata_value(item['vendors'])}")
         if item.get("version"):
             metadata_lines.append(f"version: {item['version']}")
+        if item.get("specs"):
+            metadata_lines.append(f"specs: {_metadata_value(item['specs'])}")
         if item.get("heading_level") is not None:
             metadata_lines.append(f"heading_level: {item['heading_level']}")
         if item.get("list_structure"):
@@ -286,6 +301,30 @@ def build_prompt(question: str, results: list[dict]) -> str:
         "Answer: <direct answer>\n"
         "Evidence:\n"
         "- <source filename + page + concise supporting fact>\n"
+        "- <source filename + page + concise supporting fact>\n"
+        "Notes: <optional caveat or missing information>"
+    )
+
+
+def build_structured_prompt(question: str, structured_context: str) -> str:
+    return (
+        "You are a retrieval-augmented assistant. The system has already converted the user's question "
+        "into structured conditions and already filtered the product list with program logic. "
+        "Do not decide whether a product qualifies; only format and explain the filtered products below.\n\n"
+        f"Question: {question}\n\n"
+        f"Structured context:\n{structured_context}\n\n"
+        "Rules for comparison and recommendation questions:\n"
+        "1. If the question is looking for products that meet conditions, compare all provided structured context rows.\n"
+        "2. List only products that are explicitly in 'Filtered matching products'.\n"
+        "3. Do not recommend products that failed or are missing from the filtered list.\n"
+        "4. Every recommendation must include the matching specification evidence.\n"
+        "5. If no product passed the structured filter, say no clearly supported match was found.\n"
+        "6. Do not invent specifications outside the structured context.\n\n"
+        "Output in Traditional Chinese with this structure:\n"
+        "Answer: <direct answer>\n"
+        "Recommendations:\n"
+        "- <product>: <why it matches, with exact specs>\n"
+        "Evidence:\n"
         "- <source filename + page + concise supporting fact>\n"
         "Notes: <optional caveat or missing information>"
     )
