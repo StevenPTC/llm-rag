@@ -301,6 +301,19 @@ source .venv/bin/activate
 .venv/bin/python inspect_chunks.py --format jsonl --output data/debug/chunk_inspection.jsonl
 ```
 
+如果想用瀏覽器看互動式 chunk preview：
+
+```bash
+.venv/bin/python chunk_preview.py
+```
+
+預設輸出 `data/debug/chunk_preview.html`，可以直接用瀏覽器打開。也可以只看單一 PDF 或指定輸出位置：
+
+```bash
+.venv/bin/python chunk_preview.py --source HRBS10007ZHC21DB01.pdf
+.venv/bin/python chunk_preview.py --output data/debug/chunk_preview_sample.html --limit 50
+```
+
 如果想手動調整檢索策略：
 
 ```bash
