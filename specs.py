@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ NUMERIC_SPEC_FIELDS = [
 BOOLEAN_SPEC_FIELDS = ["has_lvds", "has_mipi_dsi", "has_mipi_csi"]
 LIST_SPEC_FIELDS = ["cpu_soc", "os_list", "power_input"]
 SPEC_FIELDS = NUMERIC_SPEC_FIELDS + BOOLEAN_SPEC_FIELDS + LIST_SPEC_FIELDS
+FALLBACK_VENDOR_NAMES = ["NXP", "Rockchip", "ST", "Realtek", "Renesas"]
 
 COUNT_ALIASES = {
     "uart_count": [r"UART"],
@@ -96,6 +98,36 @@ def unique_values(values: list[str]) -> list[str]:
         seen.add(key)
         unique.append(normalized)
     return unique
+
+
+def normalize_vendor_names(vendors: list[str] | None) -> list[str]:
+    return sorted(unique_values(vendors or FALLBACK_VENDOR_NAMES), key=len, reverse=True)
+
+
+def ascii_keyword_pattern(value: str) -> str:
+    return rf"(?<![A-Za-z0-9]){re.escape(value)}(?![A-Za-z0-9])"
+
+
+def detect_vendor_mentions(text: str, known_vendors: list[str] | None = None) -> list[str]:
+    vendors = normalize_vendor_names(known_vendors)
+    matches = []
+    for vendor in vendors:
+        if re.search(ascii_keyword_pattern(vendor), text, flags=re.IGNORECASE):
+            matches.append(vendor)
+
+    # Lenient typo recovery for longer vendor names, e.g. "Renzsas" -> "Renesas".
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9./-]*", text)
+    for token in tokens:
+        if len(token) < 4:
+            continue
+        for vendor in vendors:
+            if len(vendor) < 4:
+                continue
+            similarity = SequenceMatcher(None, token.lower(), vendor.lower()).ratio()
+            if similarity >= 0.84:
+                matches.append(vendor)
+
+    return unique_values(matches)
 
 
 def normalize_for_specs(text: str) -> str:
@@ -469,7 +501,7 @@ def parse_boolean_conditions(question: str, plan: dict) -> None:
             add_condition(plan, field, "==", True, positive.group(0))
 
 
-def parse_contains_conditions(question: str, plan: dict) -> None:
+def parse_contains_conditions(question: str, plan: dict, known_vendors: list[str] | None = None) -> None:
     os_patterns = [
         r"Yocto(?:\s+Linux)?",
         r"Android(?:\s+\d+(?:\.\d+)*)?",
@@ -490,8 +522,8 @@ def parse_contains_conditions(question: str, plan: dict) -> None:
         for match in re.finditer(pattern, question, flags=re.IGNORECASE):
             add_condition(plan, "cpu_soc", "contains", match.group(0), match.group(0))
 
-    for match in re.finditer(r"\b(?:NXP|Rockchip|ST|Realtek|Renesas)\b", question, flags=re.IGNORECASE):
-        add_condition(plan, "vendor", "contains", match.group(0), match.group(0))
+    for vendor in detect_vendor_mentions(question, known_vendors=known_vendors):
+        add_condition(plan, "vendor", "contains", vendor, vendor)
 
     power_match = re.search(r"(?:DC\s*)?\d+(?:\.\d+)?\s*V(?:\s*(?:~|-|to)\s*\d+(?:\.\d+)?\s*V)?", question, flags=re.IGNORECASE)
     if power_match and re.search(r"(?:power|電源|input|輸入|DC)", question, flags=re.IGNORECASE):
@@ -507,11 +539,11 @@ def parse_support_count_conditions(question: str, plan: dict) -> None:
             add_condition(plan, field, ">=", 1, field)
 
 
-def plan_specs_query(question: str) -> dict:
+def plan_specs_query(question: str, known_vendors: list[str] | None = None) -> dict:
     plan = {"conditions": [], "referenced_fields": []}
     parse_numeric_conditions(question, plan)
     parse_boolean_conditions(question, plan)
-    parse_contains_conditions(question, plan)
+    parse_contains_conditions(question, plan, known_vendors=known_vendors)
     parse_support_count_conditions(question, plan)
     plan["referenced_fields"] = unique_values([condition["field"] for condition in plan["conditions"] if condition["field"] != "vendor"])
     plan["is_structured"] = bool(plan["conditions"])

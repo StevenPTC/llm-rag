@@ -28,6 +28,7 @@ from rag_utils import (
 )
 from specs import (
     build_product_specs,
+    detect_vendor_mentions,
     format_product_spec_line,
     format_structured_context,
     plan_specs_query,
@@ -139,6 +140,10 @@ def load_metadata() -> tuple[list[dict], dict[str, dict]]:
     records = load_jsonl(METADATA_PATH)
     metadata_by_id = {record["chunk_id"]: record for record in records}
     return records, metadata_by_id
+
+
+def known_vendors_from_records(records: list[dict]) -> list[str]:
+    return sorted(unique_list_values(records, "vendors"), key=len, reverse=True)
 
 
 def search_faiss(question: str, top_k: int, embed_model: str, records: list[dict]) -> list[dict]:
@@ -257,19 +262,8 @@ def reciprocal_rank_fusion(dense_results: list[dict], lexical_results: list[dict
     return ranked[:top_k]
 
 
-def detect_requested_vendors(question: str) -> list[str]:
-    vendors = []
-    if re.search(r"(?i)(?:^|[^a-z0-9])ST(?:$|[^a-z0-9])", question) or re.search(r"(?i)\bSTM32", question):
-        vendors.append("ST")
-    if re.search(r"(?i)\b(?:Rockchip|RK\d{4})\b", question):
-        vendors.append("Rockchip")
-    if re.search(r"(?i)\b(?:NXP|i\.MX)", question):
-        vendors.append("NXP")
-    if re.search(r"(?i)\b(?:Realtek|RTL\d+)", question):
-        vendors.append("Realtek")
-    if re.search(r"(?i)\b(?:Renesas|RZ/)", question):
-        vendors.append("Renesas")
-    return vendors
+def detect_requested_vendors(question: str, known_vendors: list[str] | None = None) -> list[str]:
+    return detect_vendor_mentions(question, known_vendors=known_vendors)
 
 
 def detect_requested_chip_models(question: str) -> list[str]:
@@ -289,8 +283,8 @@ def asks_for_product_list(question: str) -> bool:
     return bool(re.search(r"(?i)(產品|型號|有哪些|列出|尋找|list|which|what|product|model)", question))
 
 
-def metadata_query_bonus(question: str, item: dict) -> float:
-    requested_vendors = detect_requested_vendors(question)
+def metadata_query_bonus(question: str, item: dict, known_vendors: list[str] | None = None) -> float:
+    requested_vendors = detect_requested_vendors(question, known_vendors=known_vendors)
     requested_chips = set(detect_requested_chip_models(question))
     if not requested_vendors and not requested_chips:
         return 0.0
@@ -321,7 +315,8 @@ def metadata_query_bonus(question: str, item: dict) -> float:
 
 
 def add_metadata_vendor_candidates(question: str, records: list[dict], candidates: list[dict]) -> list[dict]:
-    requested_vendors = set(detect_requested_vendors(question))
+    known_vendors = known_vendors_from_records(records)
+    requested_vendors = set(detect_requested_vendors(question, known_vendors=known_vendors))
     requested_chips = set(detect_requested_chip_models(question))
     if not (requested_vendors or requested_chips) or not asks_for_product_list(question):
         return candidates
@@ -343,7 +338,7 @@ def add_metadata_vendor_candidates(question: str, records: list[dict], candidate
         item = record.copy()
         item["dense_score"] = 0.0
         item["lexical_score"] = 0.0
-        item["hybrid_score"] = base_score + metadata_query_bonus(question, item)
+        item["hybrid_score"] = base_score + metadata_query_bonus(question, item, known_vendors=known_vendors)
         item["metadata_vendor_match"] = True
         merged[item["chunk_id"]] = item
 
@@ -386,8 +381,13 @@ def unique_list_values(items: list[dict], key: str) -> list[str]:
     return values
 
 
-def select_final_primary_results(question: str, reranked_results: list[dict], args: argparse.Namespace) -> list[dict]:
-    requested_vendors = set(detect_requested_vendors(question))
+def select_final_primary_results(
+    question: str,
+    reranked_results: list[dict],
+    args: argparse.Namespace,
+    known_vendors: list[str] | None = None,
+) -> list[dict]:
+    requested_vendors = set(detect_requested_vendors(question, known_vendors=known_vendors))
     requested_chips = set(detect_requested_chip_models(question))
     if not (requested_vendors or requested_chips) or not asks_for_product_list(question):
         return reranked_results[: args.top_k]
@@ -479,7 +479,7 @@ def compact_parent_context(seed: dict, child_items: list[dict], max_tokens: int)
     return compact_text_window(parent_text, start, end, max_tokens=max_tokens)
 
 
-def heuristic_rerank_score(question: str, item: dict) -> float:
+def heuristic_rerank_score(question: str, item: dict, known_vendors: list[str] | None = None) -> float:
     query_tokens = set(tokenize(question))
     text_tokens = tokenize(build_rerank_text(item))
     overlap = len(query_tokens.intersection(text_tokens))
@@ -511,14 +511,19 @@ def heuristic_rerank_score(question: str, item: dict) -> float:
 
     return (
         float(item.get("hybrid_score", item.get("dense_score", 0.0)))
-        + metadata_query_bonus(question, item)
+        + metadata_query_bonus(question, item, known_vendors=known_vendors)
         + overlap * 0.15
         + metadata_bonus * 0.1
         + structural_bonus
     )
 
 
-def rerank_results(question: str, candidates: list[dict], reranker_model: str) -> list[dict]:
+def rerank_results(
+    question: str,
+    candidates: list[dict],
+    reranker_model: str,
+    known_vendors: list[str] | None = None,
+) -> list[dict]:
     if not candidates:
         return []
 
@@ -529,14 +534,18 @@ def rerank_results(question: str, candidates: list[dict], reranker_model: str) -
         reranked = []
         for item, score in zip(candidates, scores):
             updated = item.copy()
-            updated["rerank_score"] = float(score) + metadata_query_bonus(question, updated)
+            updated["rerank_score"] = float(score) + metadata_query_bonus(
+                question,
+                updated,
+                known_vendors=known_vendors,
+            )
             reranked.append(updated)
         reranked.sort(key=lambda item: item["rerank_score"], reverse=True)
     except Exception:
         reranked = []
         for item in candidates:
             updated = item.copy()
-            updated["rerank_score"] = heuristic_rerank_score(question, updated)
+            updated["rerank_score"] = heuristic_rerank_score(question, updated, known_vendors=known_vendors)
             reranked.append(updated)
         reranked.sort(key=lambda item: item["rerank_score"], reverse=True)
 
@@ -547,6 +556,7 @@ def rerank_results(question: str, candidates: list[dict], reranker_model: str) -
 
 def retrieve_stages(question: str, args: argparse.Namespace) -> dict[str, list[dict]]:
     records, metadata_by_id = load_metadata()
+    known_vendors = known_vendors_from_records(records)
 
     if args.backend == "faiss":
         dense_results = search_faiss(question, args.dense_top_k, args.embed_model, records)
@@ -568,9 +578,19 @@ def retrieve_stages(question: str, args: argparse.Namespace) -> dict[str, list[d
             item["rerank_score"] = item.get("hybrid_score", item.get("dense_score", 0.0))
             item["rerank_rank"] = rank
     else:
-        reranked_results = rerank_results(question, rerank_candidates, args.reranker_model)
+        reranked_results = rerank_results(
+            question,
+            rerank_candidates,
+            args.reranker_model,
+            known_vendors=known_vendors,
+        )
 
-    final_primary_results = select_final_primary_results(question, reranked_results, args)
+    final_primary_results = select_final_primary_results(
+        question,
+        reranked_results,
+        args,
+        known_vendors=known_vendors,
+    )
     final_seed_results = expand_adjacent_chunks(final_primary_results, metadata_by_id, args.adjacent_window)
 
     final_results = materialize_parent_contexts(final_seed_results, getattr(args, "parent_context_tokens", 700))
@@ -931,10 +951,12 @@ def answer_question(question: str, args: argparse.Namespace, chat_model: str | N
     if not args.no_print_results:
         print_results(results)
 
+    records, _ = load_metadata()
+    known_vendors = known_vendors_from_records(records)
     structured_plan = (
         {"is_structured": False, "conditions": []}
         if args.disable_structured_filter
-        else plan_specs_query(question)
+        else plan_specs_query(question, known_vendors=known_vendors)
     )
     structured_context = ""
     filtered_products = []
