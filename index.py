@@ -5,12 +5,18 @@ from rag_utils import CHROMA_DIR, EMBEDDINGS_PATH, FAISS_INDEX_PATH, FAISS_METAD
 
 
 def parse_args() -> argparse.Namespace:
+    # RAG 階段：Retrieval 索引建立
+    # backend 參數讓同一批 embeddings 可切換 FAISS 或 Chroma。這有助於在本機速度、
+    # 持久化能力與部署環境之間做取捨，而不改動 embedding 產製流程。
     parser = argparse.ArgumentParser(description="Build a vector index from embeddings")
     parser.add_argument("--backend", choices=["faiss", "chroma"], default="faiss", help="Vector store backend")
     return parser.parse_args()
 
 
 def build_faiss_index() -> None:
+    # RAG 階段：Retrieval 索引建立
+    # FAISS IndexFlatIP 使用內積搜尋；前一階段已將 embeddings normalize，因此內積
+    # 等價於 cosine similarity，適合做語意相似度排序。
     try:
         import faiss
     except ImportError as exc:
@@ -30,6 +36,9 @@ def build_faiss_index() -> None:
 
 
 def build_chroma_index() -> None:
+    # RAG 階段：Retrieval 索引建立
+    # Chroma 版本把文件文字、metadata 與 embedding 一起持久化，適合需要較完整
+    # 向量資料庫能力的情境；重建時先刪除舊 collection，避免重複 id 或殘留資料。
     try:
         import chromadb
     except ImportError as exc:
@@ -48,6 +57,8 @@ def build_chroma_index() -> None:
     ids = [record["chunk_id"] for record in metadata]
     documents = [record["text"] for record in metadata]
     metadatas = [
+        # Chroma metadata 只支援基本型別，因此 list 型欄位轉成逗號分隔字串。
+        # 原始完整 metadata 仍保存在 JSONL；Chroma 這份主要用於查詢結果快速展示。
         {
             "source": record["source"],
             "page": record["page"],
@@ -101,6 +112,9 @@ def build_chroma_index() -> None:
 
 
 def main() -> None:
+    # RAG 階段：Retrieval 索引建立
+    # 索引建立依賴 embedding.py 先產生 embeddings 與 metadata；缺任一檔案就中止，
+    # 避免建立出向量和 chunk metadata 對不上的索引。
     args = parse_args()
     Path(METADATA_PATH).parent.mkdir(parents=True, exist_ok=True)
 

@@ -38,6 +38,9 @@ from specs import (
 
 
 def parse_args() -> argparse.Namespace:
+    # RAG 階段：Retrieval / Re-ranking / LLM 推論
+    # 查詢端參數刻意暴露各階段 top-k 與開關，方便觀察召回、hybrid merge、
+    # rerank 與最終回答之間的品質差異，而不需要修改程式碼。
     parser = argparse.ArgumentParser(description="Query the RAG system")
     parser.add_argument("question", nargs="?", help="Question to ask")
     parser.add_argument(
@@ -130,6 +133,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def tokenize(text: str) -> list[str]:
+    # RAG 階段：Retrieval
+    # lexical search 需要簡單可控的 tokenization。英文保留型號常見符號，中文採 1-4 字滑動，
+    # 讓 BM25 類分數能處理中英混合的產品與規格查詢。
     lowered = text.lower()
     english_tokens = re.findall(r"[a-z0-9][a-z0-9._/-]*", lowered)
     chinese_tokens = re.findall(r"[\u4e00-\u9fff]{1,4}", text)
@@ -137,6 +143,9 @@ def tokenize(text: str) -> list[str]:
 
 
 def load_metadata() -> tuple[list[dict], dict[str, dict]]:
+    # RAG 階段：Retrieval
+    # 同時回傳 list 與 id map：list 對應 FAISS index 的向量順序，id map 則用於 Chroma
+    # 結果和相鄰 chunk 展開時快速查回完整 metadata。
     records = load_jsonl(METADATA_PATH)
     metadata_by_id = {record["chunk_id"]: record for record in records}
     return records, metadata_by_id
@@ -147,6 +156,9 @@ def known_vendors_from_records(records: list[dict]) -> list[str]:
 
 
 def search_faiss(question: str, top_k: int, embed_model: str, records: list[dict]) -> list[dict]:
+    # RAG 階段：Retrieval
+    # Dense retrieval 將使用者問題轉成 query embedding，再到 FAISS 找語意最接近的 chunks。
+    # 因 embeddings 已正規化，IndexFlatIP 的分數可視為 cosine similarity。
     try:
         import faiss
     except ImportError as exc:
@@ -171,6 +183,9 @@ def search_faiss(question: str, top_k: int, embed_model: str, records: list[dict
 
 
 def search_chroma(question: str, top_k: int, embed_model: str, metadata_by_id: dict[str, dict]) -> list[dict]:
+    # RAG 階段：Retrieval
+    # Chroma 查詢同樣使用 query embedding，但回傳 distance；這裡轉成越大越好的 score，
+    # 讓後續 hybrid/rerank 可以用一致的排序語意處理。
     try:
         import chromadb
     except ImportError as exc:
@@ -194,6 +209,9 @@ def search_chroma(question: str, top_k: int, embed_model: str, metadata_by_id: d
 
 
 def lexical_search(question: str, records: list[dict], top_k: int) -> list[dict]:
+    # RAG 階段：Retrieval
+    # lexical search 補足 dense retrieval 對精確型號、介面名稱與數字條件可能不穩的問題。
+    # 這裡實作 BM25-like 分數，讓稀有關鍵字與高精確詞能進入候選集。
     query_tokens = tokenize(question)
     if not query_tokens:
         return []
@@ -235,6 +253,9 @@ def lexical_search(question: str, records: list[dict], top_k: int) -> list[dict]
 
 
 def reciprocal_rank_fusion(dense_results: list[dict], lexical_results: list[dict], top_k: int) -> list[dict]:
+    # RAG 階段：Retrieval
+    # Reciprocal Rank Fusion 用排名而非原始分數合併 dense 與 lexical，避免兩種檢索分數
+    # 尺度不同造成單一路徑壓過另一個路徑。
     merged: dict[str, dict] = {}
 
     for result in dense_results:
@@ -284,6 +305,9 @@ def asks_for_product_list(question: str) -> bool:
 
 
 def metadata_query_bonus(question: str, item: dict, known_vendors: list[str] | None = None) -> float:
+    # RAG 階段：Retrieval / Re-ranking
+    # 產品清單型問題通常很依賴 vendor、chip model 這類 metadata。這個 bonus/penalty
+    # 用明確欄位校正語意檢索結果，避免向量相似但 vendor 不符的 chunk 排在前面。
     requested_vendors = detect_requested_vendors(question, known_vendors=known_vendors)
     requested_chips = set(detect_requested_chip_models(question))
     if not requested_vendors and not requested_chips:
@@ -315,6 +339,9 @@ def metadata_query_bonus(question: str, item: dict, known_vendors: list[str] | N
 
 
 def add_metadata_vendor_candidates(question: str, records: list[dict], candidates: list[dict]) -> list[dict]:
+    # RAG 階段：Retrieval
+    # 若使用者明確指定 vendor 或 chip，僅靠 dense/lexical 可能漏掉文字較短但 metadata 命中的產品。
+    # 因此額外把 metadata 命中的 chunk 加入候選集，提高產品列舉題的召回率。
     known_vendors = known_vendors_from_records(records)
     requested_vendors = set(detect_requested_vendors(question, known_vendors=known_vendors))
     requested_chips = set(detect_requested_chip_models(question))
@@ -387,6 +414,9 @@ def select_final_primary_results(
     args: argparse.Namespace,
     known_vendors: list[str] | None = None,
 ) -> list[dict]:
+    # RAG 階段：Retrieval
+    # 一般問答取 top_k 即可；產品列表題則需要去重並提高上限，否則多個 chunk 可能來自同一產品，
+    # 導致 LLM 看到的產品覆蓋率不足。
     requested_vendors = set(detect_requested_vendors(question, known_vendors=known_vendors))
     requested_chips = set(detect_requested_chip_models(question))
     if not (requested_vendors or requested_chips) or not asks_for_product_list(question):
@@ -420,6 +450,9 @@ def token_spans(text: str) -> list[dict]:
 
 
 def compact_text_window(text: str, start: int, end: int, max_tokens: int) -> str:
+    # RAG 階段：LLM 推論
+    # 回填 parent context 時不能無限制塞入全文；這裡以命中的 child span 為中心裁切視窗，
+    # 在 token budget 內保留最相關的前後文，降低 prompt 成本與干擾。
     spans = token_spans(text)
     if not spans or len(spans) <= max_tokens:
         return text.strip()
@@ -455,6 +488,9 @@ def compact_text_window(text: str, start: int, end: int, max_tokens: int) -> str
 
 
 def compact_parent_context(seed: dict, child_items: list[dict], max_tokens: int) -> str:
+    # RAG 階段：LLM 推論
+    # child chunk 負責「找到答案附近」，parent context 負責「提供答案完整語境」。
+    # 多個 child 命中同一 parent 時合併 range，可避免重複塞入相同 parent 文字。
     parent_text = seed.get("parent_text") or seed.get("text", "")
     parent_start = seed.get("parent_char_start", seed.get("char_start", 0))
     ranges = []
@@ -480,6 +516,9 @@ def compact_parent_context(seed: dict, child_items: list[dict], max_tokens: int)
 
 
 def heuristic_rerank_score(question: str, item: dict, known_vendors: list[str] | None = None) -> float:
+    # RAG 階段：Re-ranking
+    # 當 cross-encoder 不可用時，使用可解釋的 heuristic 作為 fallback。
+    # 分數混合 hybrid score、metadata match、token overlap 與結構訊號，確保查詢流程仍可運作。
     query_tokens = set(tokenize(question))
     text_tokens = tokenize(build_rerank_text(item))
     overlap = len(query_tokens.intersection(text_tokens))
@@ -524,6 +563,9 @@ def rerank_results(
     reranker_model: str,
     known_vendors: list[str] | None = None,
 ) -> list[dict]:
+    # RAG 階段：Re-ranking
+    # Cross-encoder 對「問題、候選 chunk」逐對評分，通常比向量相似度更貼近可回答性。
+    # 若模型載入或推論失敗，回退到 heuristic，讓 CLI 在缺少 reranker 時仍能產生結果。
     if not candidates:
         return []
 
@@ -555,6 +597,9 @@ def rerank_results(
 
 
 def retrieve_stages(question: str, args: argparse.Namespace) -> dict[str, list[dict]]:
+    # RAG 階段：Retrieval / Re-ranking
+    # 查詢主流程依序執行 dense retrieval、hybrid merge、metadata 補召回、rerank、
+    # final selection、相鄰 chunk 展開與 parent context 回填。回傳所有 stage 方便 debug。
     records, metadata_by_id = load_metadata()
     known_vendors = known_vendors_from_records(records)
 
@@ -603,6 +648,9 @@ def retrieve_stages(question: str, args: argparse.Namespace) -> dict[str, list[d
 
 
 def materialize_parent_contexts(results: list[dict], parent_context_tokens: int = 700) -> list[dict]:
+    # RAG 階段：LLM 推論
+    # 將多個命中的 child chunk 彙整成 parent-level context。這樣 LLM 看到的是較完整的段落，
+    # 但仍保留 matched_child_ids，方便追蹤真正觸發檢索的子 chunk。
     contexts = []
     by_parent_id: dict[str, dict] = {}
 
@@ -649,6 +697,9 @@ def materialize_parent_contexts(results: list[dict], parent_context_tokens: int 
 
 
 def expand_adjacent_chunks(results: list[dict], metadata_by_id: dict[str, dict], window: int) -> list[dict]:
+    # RAG 階段：Retrieval
+    # 相鄰 chunk 展開用來補足切分邊界造成的上下文缺口。被展開的 chunk 不代表直接命中，
+    # 因此標記 is_adjacent/adjacent_to，讓 debug 與 prompt 可區分主要證據與支援脈絡。
     if window <= 0:
         return results
 
@@ -694,6 +745,8 @@ def expand_adjacent_chunks(results: list[dict], metadata_by_id: dict[str, dict],
 
 
 def retrieve(question: str, args: argparse.Namespace) -> list[dict]:
+    # RAG 階段：Retrieval
+    # 對外提供只取 final contexts 的簡化入口；需要 debug stage 時使用 retrieve_stages。
     return retrieve_stages(question, args)["final"]
 
 
@@ -772,6 +825,9 @@ DEBUG_RESULT_KEYS = [
 
 
 def json_safe(value):
+    # RAG 階段：Retrieval
+    # debug payload 需要可序列化；將 Path、tuple 等物件轉成 JSON 友善格式，
+    # 方便保存每個 retrieval stage 的中間狀態。
     if isinstance(value, dict):
         return {str(key): json_safe(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -806,6 +862,9 @@ def write_retrieval_debug_file(
     structured_plan: dict,
     filtered_products: list[dict] | None,
 ) -> Path:
+    # RAG 階段：Retrieval / Re-ranking
+    # 保存完整 retrieval trace，包含 dense/hybrid/rerank/final 與 structured filter。
+    # 這對調整 chunk size、top-k、reranker 與 metadata bonus 時非常重要。
     debug_dir = Path(args.debug_dir)
     debug_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -844,6 +903,9 @@ def build_structured_filtered_products(
     stages: dict[str, list[dict]],
     limit: int,
 ) -> tuple[list[dict], str]:
+    # RAG 階段：Retrieval / LLM 推論
+    # 規格比較題先由程式做 deterministic filter，再把通過的產品交給 LLM 整理。
+    # 這比讓 LLM 自行比較數值可靠，尤其適合 UART/RAM/介面數量等條件。
     records, _ = load_metadata()
     products = build_product_specs(records)
     matching_products = [product for product in products if product_matches_plan(product, plan)]
@@ -878,6 +940,8 @@ def print_structured_results(plan: dict, products: list[dict]) -> None:
 
 
 def answer_with_openai(question: str, results: list[dict], chat_model: str) -> str:
+    # RAG 階段：LLM 推論
+    # OpenAI 路徑使用相同 RAG prompt，確保不同 provider 的回答約束一致。
     client = ensure_openai_client()
     response = client.responses.create(model=chat_model, input=build_prompt(question, results))
     return response.output_text
@@ -897,6 +961,9 @@ def answer_with_ollama(
     ollama_base_url: str,
     ollama_timeout: int,
 ) -> str:
+    # RAG 階段：LLM 推論
+    # Ollama 路徑使用本機模型生成最終回答；think 參數只影響模型推理模式，
+    # 不改變前面 retrieval 與 prompt 的資料邊界。
     return call_ollama_chat(
         prompt=build_prompt(question, results),
         model=chat_model,
@@ -923,6 +990,8 @@ def answer_prompt_with_ollama(
 
 
 def select_ollama_model(base_url: str) -> str:
+    # RAG 階段：LLM 推論
+    # 若使用者未指定模型，互動式選擇可避免誤用不在本機的模型名稱。
     models = list_ollama_models(base_url=base_url)
     if not models:
         raise RuntimeError("No Ollama models found. Install one with `ollama pull <model>` first.")
@@ -946,6 +1015,9 @@ def select_ollama_model(base_url: str) -> str:
 
 
 def answer_question(question: str, args: argparse.Namespace, chat_model: str | None = None) -> None:
+    # RAG 階段：Retrieval / Re-ranking / LLM 推論
+    # 單次問答的 orchestrator：先取得檢索結果，再視問題是否可結構化為 specs filter，
+    # 最後把一般 context 或 structured context 交給 LLM。
     stages = retrieve_stages(question, args)
     results = stages["final"]
     if not args.no_print_results:
@@ -1028,6 +1100,8 @@ def resolve_chat_model(args: argparse.Namespace) -> str | None:
 
 
 def interactive_loop(args: argparse.Namespace) -> None:
+    # RAG 階段：LLM 推論
+    # interactive 模式重用同一個 chat model 選擇結果，避免每題都重新詢問模型。
     chat_model = resolve_chat_model(args)
     print("Interactive RAG CLI. Type `exit`, `quit`, or `q` to stop.\n")
 

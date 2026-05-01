@@ -23,7 +23,15 @@ DEFAULT_LLM_PROVIDER = "ollama"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 
 
+# RAG 階段：共用設定
+# 路徑常數集中管理，讓 ingestion、embedding、index 與 query 使用同一批 artifacts。
+# 這可降低「向量檔、metadata、chunk 檔不一致」造成 retrieval 錯位的風險。
+
+
 def _metadata_value(value: object) -> str:
+    # RAG 階段：Embedding / LLM 推論
+    # 將 metadata 安全轉成文字表示。Embedding 與 prompt 都需要可讀的欄位文字，
+    # 但 None、list、dict 若直接轉字串會產生雜訊或格式不一致，因此在此統一處理。
     if value is None:
         return ""
     if isinstance(value, list):
@@ -44,6 +52,9 @@ def _metadata_value(value: object) -> str:
 
 
 def build_metadata_aware_text(record: dict, content_key: str = "text") -> str:
+    # RAG 階段：Embedding / Re-ranking
+    # 不只嵌入 chunk 正文，也把 title、section、product、specs 等 metadata 放入文字。
+    # 設計意圖是讓查詢「產品型號、vendor、規格」時，向量能捕捉結構化欄位的語意。
     fields = [
         ("Title", record.get("title")),
         ("Section", record.get("section")),
@@ -68,14 +79,22 @@ def build_metadata_aware_text(record: dict, content_key: str = "text") -> str:
 
 
 def build_embedding_text(record: dict) -> str:
+    # RAG 階段：Embedding
+    # Embedding 使用 metadata-aware text，讓向量同時代表 chunk 內容與其文件脈絡。
     return build_metadata_aware_text(record, content_key="text")
 
 
 def build_rerank_text(record: dict) -> str:
+    # RAG 階段：Re-ranking
+    # Re-ranker 看到的文字與 embedding 一致，可避免第一階段召回和第二階段排序
+    # 使用不同語意來源而產生排序偏差。
     return build_metadata_aware_text(record, content_key="text")
 
 
 def load_jsonl(path: Path) -> list[dict]:
+    # RAG 階段：資料前處理 / Retrieval
+    # JSONL 讓每個 page/chunk/metadata record 可以逐行儲存與檢查，適合 RAG pipeline
+    # 中間產物除錯，也避免單一大型 JSON 損壞時整批資料難以讀取。
     with path.open("r", encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
 
@@ -94,6 +113,8 @@ def load_embedding_inputs(path: Path = CHUNKS_PATH) -> list[dict]:
 
 
 def get_sentence_transformer(model_name: str = DEFAULT_EMBED_MODEL):
+    # RAG 階段：Embedding
+    # 延遲 import 可讓只使用查詢或工具函式的情境不必立刻載入大型 ML 依賴。
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
@@ -105,6 +126,9 @@ def get_sentence_transformer(model_name: str = DEFAULT_EMBED_MODEL):
 
 
 def get_cross_encoder(model_name: str = DEFAULT_RERANK_MODEL):
+    # RAG 階段：Re-ranking
+    # CrossEncoder 用 question + chunk 成對評分，比單純向量相似度更能判斷「是否回答問題」。
+    # 因其成本較高，所以只對候選 chunks 使用。
     try:
         from sentence_transformers import CrossEncoder
     except ImportError as exc:
@@ -120,6 +144,9 @@ def embed_texts(
     model_name: str = DEFAULT_EMBED_MODEL,
     batch_size: int = 32,
 ) -> np.ndarray:
+    # RAG 階段：Embedding
+    # normalize_embeddings=True 讓向量長度固定，後續 FAISS 內積搜尋即可視為 cosine similarity。
+    # float32 是向量索引常用格式，可降低記憶體與磁碟用量。
     import numpy as np
 
     model = get_sentence_transformer(model_name)
@@ -149,6 +176,8 @@ def load_embeddings(path: Path = EMBEDDINGS_PATH) -> np.ndarray:
 
 
 def ensure_openai_client():
+    # RAG 階段：LLM 推論
+    # OpenAI client 僅在使用 OpenAI provider 時建立，避免本機 Ollama 流程要求不必要的 API key。
     try:
         from openai import OpenAI
     except ImportError as exc:
@@ -165,6 +194,8 @@ def list_ollama_models(
     base_url: str = DEFAULT_OLLAMA_BASE_URL,
     timeout: int = 10,
 ) -> list[str]:
+    # RAG 階段：LLM 推論
+    # 查詢本機 Ollama 模型清單，讓 CLI 可以在沒有指定 chat model 時互動式選擇模型。
     request = urllib.request.Request(
         url=f"{base_url.rstrip('/')}/api/tags",
         headers={"Content-Type": "application/json"},
@@ -190,6 +221,9 @@ def call_ollama_chat(
     timeout: int = 120,
     think: bool | str = False,
 ) -> str:
+    # RAG 階段：LLM 推論
+    # 這裡只負責送出已組好的 prompt。Retrieval 的約束與引用格式都在 prompt 建構階段完成，
+    # 讓 provider 切換時不改變回答規則。
     payload = {
         "model": model,
         "messages": [
@@ -228,6 +262,9 @@ def call_ollama_chat(
 
 
 def format_contexts(results: list[dict]) -> str:
+    # RAG 階段：LLM 推論
+    # 將 retrieval 結果格式化成帶來源、頁碼、產品 metadata 的 evidence blocks。
+    # LLM 需要這些欄位才能回答時附上可追溯證據，而不是只看裸文字。
     blocks = []
     for idx, item in enumerate(results, start=1):
         start_page = item.get("start_page", item["page"])
@@ -283,6 +320,9 @@ def format_contexts(results: list[dict]) -> str:
 
 
 def build_prompt(question: str, results: list[dict]) -> str:
+    # RAG 階段：LLM 推論
+    # Prompt 明確要求只根據 context 回答、合併多個 chunks、指出證據不足。
+    # 這是 RAG 的防幻覺邊界：檢索提供資料，LLM 負責整合與表達，不補外部事實。
     context_text = format_contexts(results)
     return (
         "You are a retrieval-augmented assistant. Answer only from the provided context. "
@@ -307,6 +347,9 @@ def build_prompt(question: str, results: list[dict]) -> str:
 
 
 def build_structured_prompt(question: str, structured_context: str) -> str:
+    # RAG 階段：LLM 推論
+    # 結構化規格查詢已由程式完成篩選，LLM 在此只做格式化與說明。
+    # 這避免模型自行判斷數值條件，降低規格比較題的幻覺與算錯風險。
     return (
         "You are a retrieval-augmented assistant. The system has already converted the user's question "
         "into structured conditions and already filtered the product list with program logic. "

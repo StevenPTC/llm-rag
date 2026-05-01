@@ -12,6 +12,10 @@ DOCS_DIR = Path.home() / "rag-project" / "docs"
 OUTPUT_DIR = Path.home() / "rag-project" / "data"
 RAW_OUTPUT = OUTPUT_DIR / "pdf_pages.jsonl"
 CHUNK_OUTPUT = OUTPUT_DIR / "pdf_chunks.jsonl"
+
+# RAG 階段：資料前處理 / Chunk 切分
+# 這組參數決定文件被送入 Embedding 前的語意粒度。child chunk 用於精準檢索，
+# parent chunk 用於回填較完整的上下文，避免答案只看到被切斷的句子或表格片段。
 DEFAULT_CHUNK_SIZE = 320
 DEFAULT_CHUNK_OVERLAP = 50
 DEFAULT_PARENT_CHUNK_SIZE = 850
@@ -20,6 +24,9 @@ SPLIT_SEPARATORS = ["\n\n", "\n", "Q:", "A:", "Question:", "Answer:", ". ", "; "
 HEADER_FOOTER_MIN_PAGES = 2
 
 
+# RAG 階段：資料前處理
+# 章節偵測用於把 chunk 綁定到較有語意的 section/title。這不是單純美化欄位；
+# 後續 Embedding、Re-ranking 與 prompt 都會把這些 metadata 當成檢索訊號。
 SECTION_PATTERNS = [
     re.compile(r"^\s*(?:\d+(?:\.\d+)+[.)]?|\d+[.)])\s+.{3,80}$"),
     re.compile(r"^\s*(?:chapter|section)\s+\d+[:.)]?\s+.{3,80}$", re.IGNORECASE),
@@ -39,6 +46,9 @@ TOKEN_PATTERN = re.compile(
 
 
 def normalize_text(text: str) -> str:
+    # RAG 階段：資料前處理
+    # PDF 抽出的文字常包含不換行空白、斷字換行與多餘空白。先正規化可降低
+    # 同義內容在 Embedding 空間中被雜訊拉開的機率，也讓 chunk 邊界更穩定。
     text = text.replace("\u00a0", " ")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"(?<=\w)-\s*\n\s*(?=\w)", "", text)
@@ -49,6 +59,9 @@ def normalize_text(text: str) -> str:
 
 
 def format_table_as_rows(table: list[list[str | None]], table_index: int) -> str:
+    # RAG 階段：資料前處理
+    # 表格若直接攤成純文字，欄位和數值的關係容易消失；轉成 Row/Header 格式，
+    # 是為了讓規格數字在 Embedding、結構化抽取與 LLM prompt 中仍保留欄位語意。
     cleaned_rows = []
     for row in table:
         cells = [normalize_text(cell or "") for cell in row]
@@ -87,6 +100,9 @@ def format_table_as_rows(table: list[list[str | None]], table_index: int) -> str
 
 
 def extract_table_texts_with_pdfplumber(pdf_path: Path) -> dict[int, list[str]]:
+    # RAG 階段：資料前處理
+    # PyMuPDF 擅長抽一般文字，pdfplumber 對表格較友善；這裡用可選依賴補強表格，
+    # 即使套件不存在也回退成空表格，讓主要 PDF 流程不被表格抽取功能阻斷。
     try:
         import pdfplumber
     except ImportError:
@@ -106,6 +122,9 @@ def extract_table_texts_with_pdfplumber(pdf_path: Path) -> dict[int, list[str]]:
 
 
 def extract_structured_page_text(page: fitz.Page, table_texts: list[str] | None = None) -> str:
+    # RAG 階段：資料前處理
+    # 以 block 順序重組頁面文字，並把表格附加回同頁內容；這樣 page-level JSONL
+    # 既能保留原始頁碼，又能提供後續 chunk 切分需要的完整頁面上下文。
     blocks = page.get_text("blocks", sort=True)
     parts = []
 
@@ -123,6 +142,9 @@ def extract_structured_page_text(page: fitz.Page, table_texts: list[str] | None 
 
 
 def extract_pdf_pages(pdf_path: Path) -> list[dict]:
+    # RAG 階段：資料前處理
+    # 每份 PDF 先轉成 page records。頁碼與來源檔名是後續 Retrieval 引用證據的基礎，
+    # 因此在最早階段就固定下來，避免 chunk 合併後失去可追溯性。
     table_texts = extract_table_texts_with_pdfplumber(pdf_path)
     with fitz.open(pdf_path) as doc:
         raw_pages = [
@@ -150,6 +172,9 @@ def extract_pdf_pages(pdf_path: Path) -> list[dict]:
 
 
 def find_repeated_header_footer_lines(pages: list[dict]) -> set[str]:
+    # RAG 階段：資料前處理
+    # 多頁重複的頁首/頁尾通常不是回答問題的有效內容。先找出重複行，
+    # 再於清洗階段移除，可避免 Embedding 被公司名稱、頁碼等高頻雜訊污染。
     line_counts: dict[str, int] = {}
 
     for page in pages:
@@ -165,6 +190,9 @@ def find_repeated_header_footer_lines(pages: list[dict]) -> set[str]:
 
 
 def remove_header_footer(text: str, repeated_lines: set[str]) -> str:
+    # RAG 階段：資料前處理
+    # 移除頁碼、機密標記與重複頁首/頁尾，目的是提升 chunk 的有效資訊密度；
+    # 若不處理，BM25 類 lexical retrieval 也會被這些高頻字串干擾。
     cleaned_lines = []
 
     for line in text.splitlines():
@@ -184,6 +212,9 @@ def remove_header_footer(text: str, repeated_lines: set[str]) -> str:
 
 
 def make_chunk_span(text: str, start: int, end: int, base_offset: int = 0) -> dict | None:
+    # RAG 階段：Chunk 切分
+    # span 同時保存文字與在全文中的 char range。char range 讓後續可以把命中的
+    # child chunk 對回 parent chunk，並產生緊湊但連續的 LLM 上下文。
     relative_start = start - base_offset
     relative_end = end - base_offset
 
@@ -205,6 +236,9 @@ def recursive_split_spans(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     separators: list[str] | None = None,
 ) -> list[dict]:
+    # RAG 階段：Chunk 切分
+    # 這是字元長度切分的備援策略。切分時優先選段落、換行、問答標記等語意邊界，
+    # 只有在沒有可用分隔符時才硬切，目的是降低一個概念被拆成兩段的機率。
     if len(text) <= chunk_size:
         span = make_chunk_span(text, start_offset, start_offset + len(text), base_offset=start_offset)
         return [span] if span else []
@@ -293,6 +327,9 @@ def split_long_span(text: str, start_offset: int, chunk_size: int, separators: l
 
 
 def token_spans(text: str) -> list[dict]:
+    # RAG 階段：Chunk 切分
+    # token 估算同時支援英文詞、中文單字與符號。這不是模型 tokenizer 的完全等價物，
+    # 但足以讓 chunk 大小穩定，避免中文文件因沒有空白而被錯估長度。
     return [
         {"token": match.group(0), "start": match.start(), "end": match.end()}
         for match in TOKEN_PATTERN.finditer(text)
@@ -312,6 +349,9 @@ def choose_token_split_end(
     min_tokens: int,
     separators: list[str],
 ) -> int:
+    # RAG 階段：Chunk 切分
+    # 在 token budget 內盡量選擇自然分隔點作為 chunk 結尾。這個折衷能維持固定大小，
+    # 同時保留段落/句子的完整性，讓 Embedding 更容易代表單一語意單元。
     if max_end_index >= len(tokens):
         return len(tokens)
 
@@ -346,6 +386,9 @@ def token_split_spans(
     overlap: int = DEFAULT_CHUNK_OVERLAP,
     separators: list[str] | None = None,
 ) -> list[dict]:
+    # RAG 階段：Chunk 切分
+    # child chunk 使用 token-like 單位切分，並保留 overlap。overlap 用來處理答案跨
+    # 邊界的情況，避免查詢剛好命中被切開的上下文而造成 Retrieval 漏召回。
     tokens = token_spans(text)
     if not tokens:
         return []
@@ -412,6 +455,8 @@ def align_to_text_boundary(text: str, start: int, limit: int = 40) -> int:
 
 
 def add_overlap_spans(text: str, spans: list[dict], overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[dict]:
+    # RAG 階段：Chunk 切分
+    # 保留此函式作為字元 span 的 overlap 工具；目前主流程使用 token_split_spans 直接處理 overlap。
     if overlap <= 0:
         return spans
 
@@ -432,6 +477,9 @@ def chunk_text(
     overlap: int = DEFAULT_CHUNK_OVERLAP,
     start_offset: int = 0,
 ) -> list[dict]:
+    # RAG 階段：Chunk 切分
+    # 統一的 chunk 入口，讓父 chunk 與子 chunk 使用同一套切分規則，只透過 size/overlap
+    # 調整用途：父層重視上下文完整，子層重視檢索精準度。
     return token_split_spans(text, start_offset=start_offset, chunk_size=chunk_size, overlap=overlap)
 
 
@@ -495,6 +543,9 @@ def iter_line_spans(text: str) -> list[dict]:
 
 
 def split_document_sections(text: str) -> list[dict]:
+    # RAG 階段：資料前處理 / Chunk 切分
+    # 先依章節切開，再在章節內切 chunk，可避免不同章節內容被混進同一個 parent。
+    # 這會讓 metadata、rerank 與 LLM 引用的上下文更聚焦。
     line_spans = iter_line_spans(text)
     if not line_spans:
         return []
@@ -567,6 +618,9 @@ def split_document_sections(text: str) -> list[dict]:
 
 
 def extract_list_structure(text: str) -> str:
+    # RAG 階段：資料前處理
+    # 條列內容通常包含規格、步驟或功能清單。將 list 訊號寫入 metadata，
+    # 可在 Re-ranking 階段給予較高信任度，也能提示 LLM 優先抽取明確列點。
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     bullet_count = sum(bool(re.match(r"^(?:[-*•]|[0-9]+[.)]|[A-Za-z][.)])\s+", line)) for line in lines)
     if bullet_count >= 3:
@@ -577,6 +631,9 @@ def extract_list_structure(text: str) -> str:
 
 
 def extract_table_context(text: str) -> str:
+    # RAG 階段：資料前處理
+    # 表格與類表格 layout 通常是產品規格的主要來源。標記 table_context 後，
+    # 檢索與 rerank 可以把結構化資訊視為更有價值的證據。
     if "[TABLE" in text:
         return "extracted_table"
 
@@ -623,6 +680,9 @@ def extract_product_codes(text: str) -> list[str]:
 
 
 def extract_product_identity(source: str, text: str) -> dict:
+    # RAG 階段：資料前處理
+    # 產品代號、晶片型號與 vendor 是這個專案的重要查詢條件，因此在 chunk 建立時
+    # 預先抽成 metadata，讓後續 Retrieval 不必完全依賴語意向量猜測。
     source_product_codes = extract_product_codes(source)
     text_product_codes = extract_product_codes(text)
     product_codes = text_product_codes or source_product_codes
@@ -707,6 +767,9 @@ def extract_tags(text: str) -> list[str]:
 
 
 def extract_faq_pairs(text: str) -> list[dict]:
+    # RAG 階段：Chunk 切分
+    # FAQ 文件天然以 Q/A 為最小知識單元；若再依固定長度切分，問題與答案可能分離。
+    # 因此 FAQ 直接以問答對作為 chunk，提升問句式查詢的召回品質。
     pattern = re.compile(
         r"(?ims)^\s*(?:Q|Question)\s*[:：]\s*(?P<question>.*?)"
         r"^\s*(?:A|Answer)\s*[:：]\s*(?P<answer>.*?)(?=^\s*(?:Q|Question)\s*[:：]|\Z)"
@@ -739,6 +802,9 @@ def detect_language(text: str) -> str:
 
 
 def build_document_text(pages: list[dict]) -> tuple[str, list[dict]]:
+    # RAG 階段：資料前處理
+    # 將同一份文件的頁面串成全文，同時保留每頁在全文中的 char span。
+    # 這讓 chunk 可以跨頁切分，但仍能回推來源頁碼供 evidence 使用。
     parts = []
     spans = []
     cursor = 0
@@ -797,6 +863,9 @@ def build_parent_child_spans(
     parent_chunk_size: int = DEFAULT_PARENT_CHUNK_SIZE,
     parent_overlap: int = DEFAULT_PARENT_CHUNK_OVERLAP,
 ) -> list[dict]:
+    # RAG 階段：Chunk 切分
+    # 採 parent-child chunk 設計：child 負責向量檢索的精準命中，parent 負責回答時的
+    # 上下文補全。這能兼顧小 chunk 的召回精度與大 chunk 的語意連續性。
     child_spans = []
     parent_index = 0
 
@@ -844,6 +913,10 @@ def build_chunk_record(
     page_spans: list[dict],
     doc_type: str,
 ) -> dict:
+    # RAG 階段：資料前處理 / Chunk 切分
+    # 將切好的 chunk 轉成後續 pipeline 的標準資料列。除了 text，也寫入 section、
+    # product、specs、parent/child 關係與頁碼，讓 Embedding、Retrieval、Re-ranking、
+    # LLM evidence 都能使用同一份可追溯 metadata。
     start_page, end_page = find_pages_for_span(chunk["start"], chunk["end"], page_spans)
     context_text = chunk.get("parent_text", chunk["text"])
     title, detected_section = extract_title_and_section(chunk["text"])
@@ -914,6 +987,9 @@ def build_chunks(
     parent_chunk_size: int = DEFAULT_PARENT_CHUNK_SIZE,
     parent_overlap: int = DEFAULT_PARENT_CHUNK_OVERLAP,
 ) -> list[dict]:
+    # RAG 階段：Chunk 切分
+    # 依 source 分組處理，確保 prev/next chunk 只在同一份文件內相連。
+    # 這些相鄰關係會在查詢階段展開，補足命中 chunk 前後的脈絡。
     chunk_records = []
     pages_by_source: dict[str, list[dict]] = {}
 
@@ -970,6 +1046,9 @@ def write_jsonl(records: list[dict], output_path: Path) -> None:
 
 
 def main() -> None:
+    # RAG 階段：資料前處理 / Chunk 切分
+    # 執行完整 ingestion：PDF -> page JSONL -> chunk JSONL。後續 embedding.py
+    # 會讀取 CHUNK_OUTPUT，因此這裡是整個 RAG index 的資料入口。
     pdf_files = sorted(DOCS_DIR.glob("*.pdf"))
     if not pdf_files:
         raise FileNotFoundError(f"No PDF files found in {DOCS_DIR}")
